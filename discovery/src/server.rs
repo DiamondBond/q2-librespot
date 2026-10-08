@@ -290,7 +290,10 @@ impl DiscoveryServer {
 
         let (close_tx, close_rx) = oneshot::channel();
 
-        let listener = match TcpListener::bind(address) {
+        // kernels without IPv6 refuse the dual stack socket
+        let listener = match TcpListener::bind(address)
+            .or_else(|_| TcpListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), *port)))
+        {
             Ok(listener) => listener,
             Err(e) => {
                 warn!("Discovery server failed to start: {e}");
