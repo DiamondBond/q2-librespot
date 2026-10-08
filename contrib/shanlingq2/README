@@ -9,11 +9,12 @@ flashes nothing.
 
   build.sh     static soft-float build and the card files, in
                target/shanlingq2/.rockbox (copy that folder to the card)
-  launcher.sh  installed as .rockbox/rockbox: powers the DAC, then runs
-               librespot | aplay in a restart loop, in the background
+  launcher.sh  installed as .rockbox/rockbox: runs librespot | aplay in a
+               restart loop, in the background, once per boot
+  onevent.sh   librespot's --onevent: runs dacon when playback starts
   dacon.c      powers the CS43131 headphone DAC through /dev/shanling_dac,
-               the ioctls q2-rockbox's shanlingq2_codec.c uses, and holds it
-               open
+               the ioctls q2-rockbox's shanlingq2_codec.c uses; demo powers
+               it off after about 30 s with nothing of its own playing
   nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
 
 Build
@@ -47,7 +48,14 @@ corrupted the FAT once.
 Status
 ------
 
-Runs on the device: librespot starts and logs. Not yet seen: discovery on
-Wi-Fi, a Connect session, audio, and whether soft-float Vorbis decoding keeps
-up (if not, a hard-float build against the stock glibc, as q2-rockbox links,
-is the fallback). Bluetooth output is not wired up.
+Works on the device: discovery, a Connect session from the phone and audio
+on the headphones at 160 kbit/s, decoded in soft float, with no stutter
+reported. A headphone replug was needed once before sound came through.
+
+Not integrated with the stock UI, which doesn't know librespot is playing:
+  - its keys and volume don't reach librespot (the phone controls it)
+  - its standby still runs: playback stopped when the screen went off
+  - the DAC sits at -15 dB (dacon 70) under librespot's own volume
+These need Q2 Pod's side: treat librespot as playing, as it does for
+q2video (reset_poweroptions_timer, the DAC power), and forward keys and
+volume to librespot. Bluetooth output is not wired up.

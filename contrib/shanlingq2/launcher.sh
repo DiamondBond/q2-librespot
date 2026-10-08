@@ -3,6 +3,9 @@
 # place. Backgrounded so demo still starts and brings up Wi-Fi; librespot
 # restarts until Wi-Fi is up (mDNS needs an interface) and after any exit.
 cd /mnt/mmc/.rockbox
+# once per boot: Home's Rockbox shortcut runs this again while the first loop lives
+[ -e /tmp/q2-librespot ] && exit 0
+touch /tmp/q2-librespot
 while :; do
     { date; cat /proc/asound/cards; } >> ./cards.log 2>&1
     ./librespot -n Q2 -b 160 --backend pipe --cache ./cache --disable-audio-cache \
