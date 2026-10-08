@@ -1,0 +1,53 @@
+Shanling Q2 tools
+=================
+
+The Q2 runs Linux 5.15 on an Ingenic X2000 (MIPS32r2, nan2008, FP64) with
+glibc 2.28, no IPv6 and no CA bundle. librespot runs from the card as a
+Spotify Connect receiver next to the stock player, launched from the Rockbox
+slot that Q2 Pod's boot hook runs (/mnt/mmc/.rockbox/rockbox), so testing it
+flashes nothing.
+
+  build.sh     static soft-float build and the card files, in
+               target/shanlingq2/.rockbox (copy that folder to the card)
+  launcher.sh  installed as .rockbox/rockbox: powers the DAC, then runs
+               librespot | aplay in a restart loop, in the background
+  dacon.c      powers the CS43131 headphone DAC through /dev/shanling_dac,
+               the ioctls q2-rockbox's shanlingq2_codec.c uses, and holds it
+               open
+  nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
+
+Build
+-----
+
+Rust nightly with rust-src (mipsel-unknown-linux-musl is tier 3, so std is
+built with -Zbuild-std) and musl.cc's mipsel-linux-muslsf-cross:
+
+  rustup toolchain install nightly --profile minimal --component rust-src
+  contrib/shanlingq2/build.sh ~/x-tools/mipsel-linux-muslsf-cross
+
+Static and soft-float, the binary needs none of the device's glibc, its
+nan2008 interpreter or FR=1 mode. The kernel still refuses an ELF without the
+nan2008 flag (the shell then reports 'syntax error: unexpected "("'); soft
+float has no FPU instructions, so nan2008.py sets it. The tier-3 target ships
+no crt objects or libunwind, so the link uses the toolchain's crt files and
+its libgcc_eh as libunwind. TLS is rustls with webpki's compiled-in roots.
+
+Device
+------
+
+Discovery binds 0.0.0.0 when [::] fails (this branch's discovery fix). Audio
+is the pipe backend into the stock aplay on plughw:0,0, the CS43131 (card 0,
+"ecodec-sound-card"; Q2 Pod's docs call it hw:1,0 when demo has opened
+others). hciplayer holds the PCM while it plays, so local music must be
+stopped. Logs go to the card: spot.log, aplay.log, cards.log, dacon.log.
+
+Power the Q2 off before taking the card out: pulling it while mounted
+corrupted the FAT once.
+
+Status
+------
+
+Runs on the device: librespot starts and logs. Not yet seen: discovery on
+Wi-Fi, a Connect session, audio, and whether soft-float Vorbis decoding keeps
+up (if not, a hard-float build against the stock glibc, as q2-rockbox links,
+is the fallback). Bluetooth output is not wired up.
