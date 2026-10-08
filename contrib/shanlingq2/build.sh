@@ -30,5 +30,6 @@ mipsel-linux-muslsf-strip -o "$R/librespot" target/$TARGET/release/librespot
 mipsel-linux-muslsf-gcc -march=mips32r2 -static -Os -Wall -Wextra -Werror -s -o "$R/dacon" "$HERE/dacon.c"
 python3 -I "$HERE/nan2008.py" "$R/librespot" "$R/dacon"
 cp "$HERE/launcher.sh" "$R/rockbox"
-chmod +x "$R/rockbox"
+cp "$HERE/onevent.sh" "$R/"
+chmod +x "$R/rockbox" "$R/onevent.sh"
 echo "$R"
