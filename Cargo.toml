@@ -161,6 +161,7 @@ librespot-oauth.workspace = true
 librespot-playback.workspace = true
 librespot-protocol.workspace = true
 
+bytes = "1"
 data-encoding = "2.5"
 env_logger = { version = "0.11.2", default-features = false, features = [
     "color",
@@ -169,6 +170,8 @@ env_logger = { version = "0.11.2", default-features = false, features = [
 ] }
 futures-util = { version = "0.3", default-features = false }
 getopts = "0.2"
+http = "1"
+libc = "0.2"
 log = "0.4"
 sha1 = "0.10"
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
@@ -179,6 +182,7 @@ tokio = { version = "1", features = [
     "signal",
     "sync",
     "process",
+    "net",
 ] }
 url = "2.2"
 

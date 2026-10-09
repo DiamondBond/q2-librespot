@@ -1799,10 +1799,13 @@ dependencies = [
 name = "librespot"
 version = "0.8.0"
 dependencies = [
+ "bytes",
  "data-encoding",
  "env_logger",
  "futures-util",
  "getopts",
+ "http",
+ "libc",
  "librespot-audio",
  "librespot-connect",
  "librespot-core",

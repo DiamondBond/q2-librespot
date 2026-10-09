@@ -35,10 +35,11 @@ use std::{
 };
 use sysinfo::{ProcessesToUpdate, System};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::{net::UnixDatagram, sync::Semaphore};
 use url::Url;
 
 mod player_event_handler;
+mod status_file;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
 fn device_id(name: &str) -> String {
@@ -219,6 +220,8 @@ struct Setup {
     zeroconf_port: u16,
     player_event_program: Option<String>,
     emit_sink_events: bool,
+    control_socket: Option<PathBuf>,
+    status_file: Option<PathBuf>,
     zeroconf_ip: Vec<std::net::IpAddr>,
     zeroconf_backend: Option<DnsSdServiceBuilder>,
 }
@@ -239,6 +242,7 @@ async fn get_setup() -> Setup {
     const BITRATE: &str = "bitrate";
     const CACHE: &str = "cache";
     const CACHE_SIZE_LIMIT: &str = "cache-size-limit";
+    const CONTROL_SOCKET: &str = "control-socket";
     const DEVICE: &str = "device";
     const DEVICE_TYPE: &str = "device-type";
     const DEVICE_IS_GROUP: &str = "group";
@@ -272,6 +276,7 @@ async fn get_setup() -> Setup {
     const PASSWORD: &str = "password";
     const PROXY: &str = "proxy";
     const QUIET: &str = "quiet";
+    const STATUS_FILE: &str = "status-file";
     const SYSTEM_CACHE: &str = "system-cache";
     const TEMP_DIR: &str = "tmp";
     const USERNAME: &str = "username";
@@ -337,6 +342,8 @@ async fn get_setup() -> Setup {
     const ZEROCONF_PORT_SHORT: &str = "z";
     const ZEROCONF_BACKEND_SHORT: &str = ""; // no short flag
     const LOCAL_FILE_DIR_SHORT: &str = "l";
+    const CONTROL_SOCKET_SHORT: &str = ""; // no short flag
+    const STATUS_FILE_SHORT: &str = ""; // no short flag
 
     // Options that have different descriptions
     // depending on what backends were enabled at build time.
@@ -667,6 +674,16 @@ async fn get_setup() -> Setup {
         LOCAL_FILE_DIR,
         "Directory to search for local file playback. Can be specified multiple times to add multiple search directories",
         "DIRECTORY"
+    ).optopt(
+        CONTROL_SOCKET_SHORT,
+        CONTROL_SOCKET,
+        "Unix datagram socket to bind for playback commands: 'p' play/pause, 's' pause, 'n' next, 'b' previous, 'S' and a position in ms to seek.",
+        "PATH"
+    ).optopt(
+        STATUS_FILE_SHORT,
+        STATUS_FILE,
+        "File to keep the player's state, track and position in, with the track's cover in PATH.jpg.",
+        "PATH"
     );
 
     #[cfg(feature = "passthrough-decoder")]
@@ -1838,6 +1855,8 @@ async fn get_setup() -> Setup {
 
     let player_event_program = opt_str(ONEVENT);
     let emit_sink_events = opt_present(EMIT_SINK_EVENTS);
+    let control_socket = opt_str(CONTROL_SOCKET).map(PathBuf::from);
+    let status_file = opt_str(STATUS_FILE).map(PathBuf::from);
 
     Setup {
         format,
@@ -1855,6 +1874,8 @@ async fn get_setup() -> Setup {
         zeroconf_port,
         player_event_program,
         emit_sink_events,
+        control_socket,
+        status_file,
         zeroconf_ip,
         zeroconf_backend,
     }
@@ -2005,8 +2026,42 @@ async fn main() {
         }
     }
 
+    if let Some(path) = setup.status_file.clone() {
+        status_file::run(
+            player.get_player_event_channel(),
+            path,
+            setup.session_config.proxy.clone(),
+        );
+    }
+
+    let control = setup.control_socket.as_ref().and_then(|path| {
+        let _ = std::fs::remove_file(path);
+        UnixDatagram::bind(path)
+            .map_err(|e| error!("Could not bind {}: {e}", path.display()))
+            .ok()
+    });
+    let mut command = [0u8; 16];
+
     loop {
         tokio::select! {
+            Ok(n) = async { control.as_ref().unwrap().recv(&mut command).await }, if control.is_some() => {
+                if let Some(spirc) = spirc.as_ref() {
+                    let result = match &command[..n] {
+                        b"p" => spirc.play_pause(),
+                        b"s" => spirc.pause(),
+                        b"n" => spirc.next(),
+                        b"b" => spirc.prev(),
+                        [b'S', ms @ ..] => match std::str::from_utf8(ms).ok().and_then(|ms| ms.parse().ok()) {
+                            Some(ms) => spirc.set_position_ms(ms),
+                            None => Ok(()),
+                        },
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        warn!("Control command failed: {e}");
+                    }
+                }
+            },
             credentials = async {
                 match discovery.as_mut() {
                     Some(d) => d.next().await,
