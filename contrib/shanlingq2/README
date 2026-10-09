@@ -13,7 +13,8 @@ Nothing is flashed for it.
   launcher.sh  installed as .spotify/run: librespot in a restart loop, in the
                background, once per boot
   aplay.sh     the subprocess sink: the stock aplay on plughw:0,0, retried for
-               3 s while local music lets the PCM go
+               3 s while local music lets the PCM go; Q2 Pod's q2video -s on
+               the device /tmp/q2-librespot.out names (Bluetooth, USB DAC)
   nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
 
 Install
@@ -53,7 +54,8 @@ librespot is started with:
       aplay runs only while librespot plays, so the PCM is free for local
       music whenever it is paused (hciplayer takes one client per PCM)
   --volume-ctrl fixed --initial-volume 100
-      the Q2's volume is the DAC's, which Q2 Pod sets
+      the Q2's volume is the DAC's, which Q2 Pod sets, or on Bluetooth and
+      a USB DAC without its own volume q2video's soft volume
   --status-file /tmp/q2-librespot.state
       this branch: the state (none without a Connect session, stopped,
       paused, playing), the track's id, title, artists, album and duration,
@@ -77,5 +79,10 @@ Works on the device: discovery, a Connect session from the phone and audio
 on the headphones at 160 kbit/s, decoded in soft float, with no stutter
 reported. Q2 Pod's integration (the page, keys, volume, standby, DAC and the
 hand-over with local music) is described in q2-pod's docs/internals.md
-(Spotify). Bluetooth and USB outputs are not wired up: librespot plays on the
-headphone DAC.
+(Spotify). With Bluetooth or a USB DAC as the Q2's output, Q2 Pod writes
+/tmp/q2-librespot.out ("plug:bluealsa 42": the ALSA device and the volume,
+"h" before it when a USB DAC applies it) and aplay.sh plays through Q2 Pod's
+/usr/bin/q2video -s DEVICE VOLUME, which applies hciplayer's soft volume and
+takes volume changes from Q2 Pod on /tmp/q2sink.sock. Without the file, as
+with older Q2 Pod, it is aplay on the headphone DAC. The output is picked at
+each sink start: one switched while playing takes over after pause and play.
