@@ -16,6 +16,13 @@ Nothing is flashed for it.
                3 s while local music lets the PCM go
   nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
 
+Install
+-------
+
+Releases ship the card files prebuilt: unzip q2-librespot-*.zip from
+https://github.com/DiamondBond/q2-librespot/releases/latest to the card's
+root with the Q2 powered off. See the top-level README.md.
+
 Build
 -----
 

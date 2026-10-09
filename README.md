@@ -1,3 +1,19 @@
+# Shanling Q2 build
+
+This fork runs librespot on the **Shanling Q2** as a Spotify Connect speaker for [Q2 Pod](https://github.com/DiamondBond/q2-pod), which adds **Streaming → Spotify**. It needs Spotify Premium and a Q2 Pod build newer than V9.8.
+
+**Install:**
+
+1. Download `q2-librespot-*.zip` from the [latest release](https://github.com/DiamondBond/q2-librespot/releases/latest).
+2. Power the Q2 off, then put its microSD card in your computer.
+3. Unzip the file to the card's root, so the card has `.spotify/librespot`, `.spotify/run` and `.spotify/aplay.sh`. The leading dot hides the folder on macOS (Cmd+Shift+. in Finder shows it) and Linux.
+4. Eject the card, put it back in the Q2 and power it on.
+5. Open **Streaming → Spotify** on the Q2, then pick **Q2** in the Spotify app on a phone on the same Wi-Fi. The login is saved in `.spotify/cache/`, so afterwards the Q2 shows up in Spotify shortly after each power-on.
+
+To update, replace `.spotify/librespot`, `run` and `aplay.sh` and keep `cache/`. To remove it, delete `.spotify`. Building it yourself and how it works: [contrib/shanlingq2/README](contrib/shanlingq2/README).
+
+---
+
 [![Build Status](https://github.com/librespot-org/librespot/workflows/build/badge.svg)](https://github.com/librespot-org/librespot/actions)
 [![Gitter chat](https://badges.gitter.im/librespot-org/librespot.png)](https://gitter.im/librespot-org/spotify-connect-resources)
 [![Crates.io](https://img.shields.io/crates/v/librespot.svg)](https://crates.io/crates/librespot)
