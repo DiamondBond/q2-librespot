@@ -1,6 +1,6 @@
 # Shanling Q2 build
 
-This fork runs librespot on the **Shanling Q2** as a Spotify Connect speaker for [Q2 Pod](https://github.com/DiamondBond/q2-pod), which adds **Streaming → Spotify**. It needs Spotify Premium and a Q2 Pod build newer than V9.8.
+This fork runs librespot on the **Shanling Q2** as a Spotify Connect speaker for [Q2 Pod](https://github.com/DiamondBond/q2-pod), which adds **Streaming → Spotify**. It needs Spotify Premium and Q2 Pod V9.9 or later.
 
 **Install:**
 
