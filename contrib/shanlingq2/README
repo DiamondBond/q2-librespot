@@ -2,19 +2,18 @@ Shanling Q2 tools
 =================
 
 The Q2 runs Linux 5.15 on an Ingenic X2000 (MIPS32r2, nan2008, FP64) with
-glibc 2.28, no IPv6 and no CA bundle. librespot runs from the card as a
-Spotify Connect receiver next to the stock player, launched from the Rockbox
-slot that Q2 Pod's boot hook runs (/mnt/mmc/.rockbox/rockbox), so testing it
-flashes nothing.
+glibc 2.28, no IPv6 and no CA bundle. librespot runs from the card's .spotify
+folder as a Spotify Connect receiver beside the stock player, and Q2 Pod
+(https://github.com/DiamondBond/q2-pod) starts it, shows what it plays on
+Streaming -> Spotify, and hands it the keys, the DAC and the power timers.
+Nothing is flashed for it.
 
   build.sh     static soft-float build and the card files, in
-               target/shanlingq2/.rockbox (copy that folder to the card)
-  launcher.sh  installed as .rockbox/rockbox: runs librespot | aplay in a
-               restart loop, in the background, once per boot
-  onevent.sh   librespot's --onevent: runs dacon when playback starts
-  dacon.c      powers the CS43131 headphone DAC through /dev/shanling_dac,
-               the ioctls q2-rockbox's shanlingq2_codec.c uses; demo powers
-               it off after about 30 s with nothing of its own playing
+               target/shanlingq2/.spotify (copy that folder to the card's root)
+  launcher.sh  installed as .spotify/run: librespot in a restart loop, in the
+               background, once per boot
+  aplay.sh     the subprocess sink: the stock aplay on plughw:0,0, retried for
+               3 s while local music lets the PCM go
   nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
 
 Build
@@ -36,26 +35,39 @@ its libgcc_eh as libunwind. TLS is rustls with webpki's compiled-in roots.
 Device
 ------
 
-Discovery binds 0.0.0.0 when [::] fails (this branch's discovery fix). Audio
-is the pipe backend into the stock aplay on plughw:0,0, the CS43131 (card 0,
-"ecodec-sound-card"; Q2 Pod's docs call it hw:1,0 when demo has opened
-others). hciplayer holds the PCM while it plays, so local music must be
-stopped. Logs go to the card: spot.log, aplay.log, cards.log, dacon.log.
+Discovery binds 0.0.0.0 when [::] fails (this branch's discovery fix). Q2 Pod
+runs .spotify/run when Streaming's Spotify row is first pressed, or at boot
+once .spotify/cache holds a login (the first Connect handoff saves it).
 
-Power the Q2 off before taking the card out: pulling it while mounted
-corrupted the FAT once.
+librespot is started with:
+
+  --backend subprocess --device "/bin/sh ./aplay.sh"
+      aplay runs only while librespot plays, so the PCM is free for local
+      music whenever it is paused (hciplayer takes one client per PCM)
+  --volume-ctrl fixed --initial-volume 100
+      the Q2's volume is the DAC's, which Q2 Pod sets
+  --status-file /tmp/q2-librespot.state
+      this branch: the state (none without a Connect session, stopped,
+      paused, playing), the track's id, title, artists, album and duration,
+      its position at a CLOCK_MONOTONIC time, and cover=1 once the file's
+      .jpg holds the track's cover, which librespot downloads itself
+  --control-socket /tmp/q2-librespot.sock
+      this branch: datagrams 'p' play/pause, 's' pause, 'n' next,
+      'b' previous, 'S' and ms to seek, from the Q2's keys
+
+Logs go to the card: spot.log, aplay.log. With a file named debug in
+.spotify, load.log gets the load average and librespot's VmRSS every 10 s,
+and Q2 Pod writes q2pod.log (each hand-over step).
+
+Power the Q2 off before taking the card out or putting it in: swapping it
+while the Q2 was on or asleep corrupted the FAT twice.
 
 Status
 ------
 
 Works on the device: discovery, a Connect session from the phone and audio
 on the headphones at 160 kbit/s, decoded in soft float, with no stutter
-reported. A headphone replug was needed once before sound came through.
-
-Not integrated with the stock UI, which doesn't know librespot is playing:
-  - its keys and volume don't reach librespot (the phone controls it)
-  - its standby still runs: playback stopped when the screen went off
-  - the DAC sits at -15 dB (dacon 70) under librespot's own volume
-These need Q2 Pod's side: treat librespot as playing, as it does for
-q2video (reset_poweroptions_timer, the DAC power), and forward keys and
-volume to librespot. Bluetooth output is not wired up.
+reported. Q2 Pod's integration (the page, keys, volume, standby, DAC and the
+hand-over with local music) is described in q2-pod's docs/internals.md
+(Spotify). Bluetooth and USB outputs are not wired up: librespot plays on the
+headphone DAC.
