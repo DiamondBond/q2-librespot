@@ -1,6 +1,6 @@
 #!/bin/sh
-# Installed as /mnt/mmc/.spotify/run. Q2 Pod starts it once per boot, from the Spotify row, or at
-# boot once cache/ holds a login. librespot restarts after any exit (mDNS needs Wi-Fi up), backing
+# Installed as /mnt/mmc/.spotify/run. Q2 Pod starts it once per boot, when Streaming's Spotify row
+# is first opened. librespot restarts after any exit (mDNS needs Wi-Fi up), backing
 # off to a minute while it keeps failing. /tmp/q2-librespot, the restart loop's pid, makes a second
 # run exit and lets Q2 Pod stop it. With a file named debug here, load.log gets the load and
 # librespot's memory every 10 s.

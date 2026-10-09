@@ -43,8 +43,9 @@ Device
 ------
 
 Discovery binds 0.0.0.0 when [::] fails (this branch's discovery fix). Q2 Pod
-runs .spotify/run when Streaming's Spotify row is first pressed, or at boot
-once .spotify/cache holds a login (the first Connect handoff saves it).
+runs .spotify/run when Streaming's Spotify row is first pressed after each
+boot, and never otherwise; .spotify/cache keeps the login (the first Connect
+handoff saves it).
 
 librespot is started with:
 
