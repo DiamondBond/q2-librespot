@@ -677,7 +677,7 @@ async fn get_setup() -> Setup {
     ).optopt(
         CONTROL_SOCKET_SHORT,
         CONTROL_SOCKET,
-        "Unix datagram socket to bind for playback commands: 'p' play/pause, 's' pause, 'n' next, 'b' previous, 'S' and a position in ms to seek.",
+        "Unix datagram socket to bind for playback commands: 'p' play/pause, 'P' play, 's' pause, 'n' next, 'b' previous, 'S' and a position in ms to seek.",
         "PATH"
     ).optopt(
         STATUS_FILE_SHORT,
@@ -2052,10 +2052,8 @@ async fn main() {
                         b"s" => spirc.pause(),
                         b"n" => spirc.next(),
                         b"b" => spirc.prev(),
-                        [b'S', ms @ ..] => match std::str::from_utf8(ms).ok().and_then(|ms| ms.parse().ok()) {
-                            Some(ms) => spirc.set_position_ms(ms),
-                            None => Ok(()),
-                        },
+                        [b'S', ms @ ..] => std::str::from_utf8(ms).ok().and_then(|ms| ms.parse().ok())
+                            .map_or(Ok(()), |ms| spirc.set_position_ms(ms)),
                         _ => Ok(()),
                     };
                     if let Err(e) = result {

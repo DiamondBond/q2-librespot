@@ -7,7 +7,6 @@ use librespot::{
 };
 use log::warn;
 use std::{
-    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -28,6 +27,15 @@ struct Status {
     position_ms: u32,
     at_ms: u64,
     cover: bool,
+}
+
+impl Status {
+    fn new(state: &'static str) -> Self {
+        Status {
+            state,
+            ..Default::default()
+        }
+    }
 }
 
 /// Milliseconds on CLOCK_MONOTONIC, the clock a reader on the same machine can compare
@@ -56,9 +64,7 @@ fn write_atomic(path: &Path, data: &[u8]) {
 }
 
 fn write_status(path: &Path, s: &Status) {
-    let mut out = String::new();
-    let _ = write!(
-        out,
+    let out = format!(
         "state={}\ntrack={}\ntitle={}\nartist={}\nalbum={}\nduration={}\nposition={}\nat={}\ncover={}\n",
         s.state,
         s.track,
@@ -95,10 +101,7 @@ async fn fetch_cover(client: &HttpClient, url: &str) -> Option<Bytes> {
 /// position at `at` (CLOCK_MONOTONIC ms). Each track's cover is fetched to `path.jpg`, and
 /// `cover=1` once that file holds the current track's.
 pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
-    let status = Arc::new(Mutex::new(Status {
-        state: "none",
-        ..Default::default()
-    }));
+    let status = Arc::new(Mutex::new(Status::new("none")));
     write_status(&path, &status.lock().unwrap());
     let client = Arc::new(HttpClient::new(proxy.as_ref()));
 
@@ -106,18 +109,8 @@ pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
         while let Some(event) = events.recv().await {
             let mut s = status.lock().unwrap();
             match event {
-                PlayerEvent::SessionConnected { .. } => {
-                    *s = Status {
-                        state: "stopped",
-                        ..Default::default()
-                    }
-                }
-                PlayerEvent::SessionDisconnected { .. } => {
-                    *s = Status {
-                        state: "none",
-                        ..Default::default()
-                    }
-                }
+                PlayerEvent::SessionConnected { .. } => *s = Status::new("stopped"),
+                PlayerEvent::SessionDisconnected { .. } => *s = Status::new("none"),
                 PlayerEvent::TrackChanged { audio_item } => {
                     s.track = audio_item.track_id.to_id().unwrap_or_default();
                     s.title = one_line(&audio_item.name);
