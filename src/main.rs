@@ -2048,6 +2048,7 @@ async fn main() {
                 if let Some(spirc) = spirc.as_ref() {
                     let result = match &command[..n] {
                         b"p" => spirc.play_pause(),
+                        b"P" => spirc.play(),
                         b"s" => spirc.pause(),
                         b"n" => spirc.next(),
                         b"b" => spirc.prev(),

@@ -62,8 +62,8 @@ librespot is started with:
       its position at a CLOCK_MONOTONIC time, and cover=1 once the file's
       .jpg holds the track's cover, which librespot downloads itself
   --control-socket /tmp/q2-librespot.sock
-      this branch: datagrams 'p' play/pause, 's' pause, 'n' next,
-      'b' previous, 'S' and ms to seek, from the Q2's keys
+      this branch: datagrams 'p' play/pause, 'P' play, 's' pause,
+      'n' next, 'b' previous, 'S' and ms to seek, from the Q2's keys
 
 Logs go to the card: spot.log, aplay.log. With a file named debug in
 .spotify, load.log gets the load average and librespot's VmRSS every 10 s,
