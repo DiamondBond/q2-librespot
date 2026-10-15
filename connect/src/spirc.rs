@@ -20,6 +20,7 @@ use crate::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
+        player::ProvidedTrack,
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -41,7 +42,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::sleep,
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -132,6 +136,26 @@ enum SpircCommand {
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
+    Queue(oneshot::Sender<QueueState>),
+    AddToQueue(String),
+    SkipTo(usize, String, oneshot::Sender<bool>),
+}
+
+/// The upcoming tracks and play options, for a device-side queue view.
+#[derive(Debug, Clone, Default)]
+pub struct QueueState {
+    /// Upcoming track URIs, in play order; [Spirc::skip_to] indexes this list.
+    pub next: Vec<String>,
+    /// Shuffling the context.
+    pub shuffle: bool,
+    /// Repeating the context.
+    pub repeat_context: bool,
+    /// Repeating the current track.
+    pub repeat_track: bool,
+}
+
+fn is_queue_entry(track: &ProvidedTrack) -> bool {
+    track.uri.starts_with("spotify:track:") && !track.is_unavailable()
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -142,6 +166,7 @@ const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
 
 /// The spotify connect handle
+#[derive(Clone)]
 pub struct Spirc {
     commands: mpsc::UnboundedSender<SpircCommand>,
 }
@@ -410,6 +435,29 @@ impl Spirc {
             .commands
             .send(SpircCommand::Transfer(transfer_request))?)
     }
+
+    /// The upcoming tracks and play options; `None` while we are not the active device.
+    pub async fn queue(&self) -> Result<Option<QueueState>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(SpircCommand::Queue(tx))?;
+        Ok(rx.await.ok())
+    }
+
+    /// Appends a track to the queue.
+    ///
+    /// Does nothing if we are not the active device.
+    pub fn add_to_queue(&self, uri: String) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+    }
+
+    /// Plays entry `position` of [QueueState::next] if it is still `uri`; false otherwise
+    /// or when we are not the active device.
+    pub async fn skip_to(&self, position: usize, uri: String) -> Result<bool, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(SpircCommand::SkipTo(position, uri, tx))?;
+        Ok(rx.await.unwrap_or(false))
+    }
 }
 
 impl SpircTask {
@@ -654,6 +702,23 @@ impl SpircTask {
                 self.handle_activate();
                 return self.notify().await;
             }
+            SpircCommand::Queue(reply) => {
+                if self.connect_state.is_active() {
+                    let player = self.connect_state.player();
+                    let _ = reply.send(QueueState {
+                        next: player
+                            .next_tracks
+                            .iter()
+                            .filter(|t| is_queue_entry(t))
+                            .map(|t| t.uri.clone())
+                            .collect(),
+                        shuffle: self.connect_state.shuffling_context(),
+                        repeat_context: self.connect_state.repeat_context(),
+                        repeat_track: self.connect_state.repeat_track(),
+                    });
+                }
+                return Ok(());
+            }
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
                 warn!("SpircCommand::{cmd:?} will be ignored while already active")
             }
@@ -679,6 +744,17 @@ impl SpircTask {
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::AddToQueue(uri) => {
+                let track = ProvidedTrack {
+                    uri,
+                    ..Default::default()
+                };
+                self.connect_state.add_to_queue(track, true)
+            }
+            SpircCommand::SkipTo(position, uri, reply) => {
+                let found = self.handle_skip_to(position, &uri)?;
+                let _ = reply.send(found);
+            }
         };
 
         self.notify().await
@@ -1636,6 +1712,28 @@ impl SpircTask {
             self.handle_stop();
             Ok(())
         }
+    }
+
+    fn handle_skip_to(&mut self, position: usize, uri: &str) -> Result<bool, Error> {
+        let next = self.connect_state.player().next_tracks.iter();
+        if next
+            .filter(|t| is_queue_entry(t))
+            .nth(position)
+            .map(|t| t.uri.as_str())
+            != Some(uri)
+        {
+            return Ok(false);
+        }
+        // next_track skips delimiters and unavailable entries itself
+        let mut left = position + 1;
+        while left > 0 && self.connect_state.next_track()?.is_some() {
+            if self.connect_state.current_track(|t| is_queue_entry(t)) {
+                left -= 1;
+            }
+        }
+        self.add_autoplay_resolving_when_required();
+        self.load_track(true, 0)?;
+        Ok(true)
     }
 
     fn handle_prev(&mut self) -> Result<(), Error> {

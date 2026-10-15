@@ -44,11 +44,14 @@ pub const RATE_LIMIT_CALLS_PER_INTERVAL: u32 = 300;
 pub enum HttpClientError {
     #[error("Response status code: {0}")]
     StatusCode(hyper::StatusCode),
+    #[error("Rate limited for {} seconds", .0.as_secs())]
+    RetryAfter(Duration),
 }
 
 impl From<HttpClientError> for Error {
     fn from(err: HttpClientError) -> Self {
         match err {
+            HttpClientError::RetryAfter(_) => Error::resource_exhausted(err),
             HttpClientError::StatusCode(code) => {
                 // not exhaustive, but what reasonably could be expected
                 match code {
@@ -201,13 +204,17 @@ impl HttpClient {
                 let code = response.status();
 
                 if code == StatusCode::TOO_MANY_REQUESTS {
-                    if let Some(duration) = Self::get_retry_after(response.headers()) {
-                        warn!(
-                            "Rate limited by service, retrying in {} seconds...",
-                            duration.as_secs()
-                        );
-                        tokio::time::sleep(duration).await;
-                        continue;
+                    match Self::retry_after(response.headers()) {
+                        Some(duration) if duration <= RATE_LIMIT_MAX_WAIT => {
+                            warn!(
+                                "Rate limited by service, retrying in {} seconds...",
+                                duration.as_secs()
+                            );
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        Some(duration) => return Err(HttpClientError::RetryAfter(duration).into()),
+                        None => (),
                     }
                 }
 
@@ -260,6 +267,21 @@ impl HttpClient {
     }
 
     pub fn get_retry_after(headers: &HeaderMap<HeaderValue>) -> Option<Duration> {
+        let duration = Self::retry_after(headers)?;
+        if duration <= RATE_LIMIT_MAX_WAIT {
+            Some(duration)
+        } else {
+            debug!(
+                "Waiting {} seconds would exceed {} second limit",
+                duration.as_secs(),
+                RATE_LIMIT_MAX_WAIT.as_secs()
+            );
+            None
+        }
+    }
+
+    /// How long a rate-limited response asks us to wait, however long that is.
+    pub fn retry_after(headers: &HeaderMap<HeaderValue>) -> Option<Duration> {
         let now = Date::now_utc().as_timestamp_ms();
 
         let mut retry_after_ms = None;
@@ -286,19 +308,8 @@ impl HttpClient {
             }
         }
 
-        if let Some(retry_after) = retry_after_ms {
-            let duration = Duration::from_millis(retry_after as u64);
-            if duration <= RATE_LIMIT_MAX_WAIT {
-                return Some(duration);
-            } else {
-                debug!(
-                    "Waiting {} seconds would exceed {} second limit",
-                    duration.as_secs(),
-                    RATE_LIMIT_MAX_WAIT.as_secs()
-                );
-            }
-        }
-
-        None
+        retry_after_ms
+            .and_then(|ms| u64::try_from(ms).ok())
+            .map(Duration::from_millis)
     }
 }

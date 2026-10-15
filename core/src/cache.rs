@@ -347,6 +347,14 @@ impl Cache {
         }
     }
 
+    /// Deletes the saved credentials, if any.
+    pub fn remove_credentials(&self) -> Result<(), Error> {
+        match self.credentials_location.as_ref().map(fs::remove_file) {
+            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn volume(&self) -> Option<u16> {
         let location = self.volume_location.as_ref()?;
 
