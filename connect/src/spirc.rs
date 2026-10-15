@@ -135,9 +135,9 @@ enum SpircCommand {
     SetVolume(u16),
     Activate,
     Transfer(Option<TransferRequest>),
-    Load(LoadRequest),
+    Load(LoadRequest, Option<oneshot::Sender<bool>>),
     Queue(oneshot::Sender<QueueState>),
-    AddToQueue(String),
+    AddToQueue(String, oneshot::Sender<()>),
     SkipTo(usize, String, oneshot::Sender<bool>),
 }
 
@@ -410,7 +410,14 @@ impl Spirc {
     ///
     /// Does not overwrite the queue.
     pub fn load(&self, command: LoadRequest) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::Load(command))?)
+        Ok(self.commands.send(SpircCommand::Load(command, None))?)
+    }
+
+    /// Loads like [Spirc::load], then tells whether the context and its track were found.
+    pub async fn load_checked(&self, command: LoadRequest) -> Result<bool, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(SpircCommand::Load(command, Some(tx)))?;
+        Ok(rx.await.unwrap_or(false))
     }
 
     /// Disconnects the current device and pauses the playback according the value.
@@ -443,11 +450,11 @@ impl Spirc {
         Ok(rx.await.ok())
     }
 
-    /// Appends a track to the queue.
-    ///
-    /// Does nothing if we are not the active device.
-    pub fn add_to_queue(&self, uri: String) -> Result<(), Error> {
-        Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+    /// Appends a track to the queue; false if we are not the active device.
+    pub async fn add_to_queue(&self, uri: String) -> Result<bool, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(SpircCommand::AddToQueue(uri, tx))?;
+        Ok(rx.await.is_ok())
     }
 
     /// Plays entry `position` of [QueueState::next] if it is still `uri`; false otherwise
@@ -743,13 +750,20 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
-            SpircCommand::AddToQueue(uri) => {
+            SpircCommand::Load(command, reply) => {
+                let result = self.handle_load(command, None, None).await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result.is_ok());
+                }
+                result?
+            }
+            SpircCommand::AddToQueue(uri, reply) => {
                 let track = ProvidedTrack {
                     uri,
                     ..Default::default()
                 };
-                self.connect_state.add_to_queue(track, true)
+                self.connect_state.add_to_queue(track, true);
+                let _ = reply.send(());
             }
             SpircCommand::SkipTo(position, uri, reply) => {
                 let found = self.handle_skip_to(position, &uri)?;
@@ -1374,6 +1388,36 @@ impl SpircTask {
         // for play commands with skip by uid, the context of the command contains
         // tracks with uri and uid, so we merge the new context with the resolved/existing context
         self.connect_state.merge_context(page);
+
+        // a track past the first page lies in pages the context only listed: fetch those now
+        let missing = |state: &ConnectState| {
+            let Ok(ctx) = state.get_context(ContextType::Default) else {
+                return false;
+            };
+            match &cmd_options.playing_track {
+                Some(PlayingTrack::Index(i)) => ctx.tracks.len() <= *i as usize,
+                Some(PlayingTrack::Uri(uri)) => {
+                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri).is_err()
+                }
+                _ => false,
+            }
+        };
+        while self.context_resolver.has_next() && missing(&self.connect_state) {
+            let next = self.context_resolver.get_next_context(Vec::new).await;
+            match next.and_then(|ctx| {
+                self.context_resolver
+                    .apply_next_context(&mut self.connect_state, ctx)
+            }) {
+                Ok(remaining) => self
+                    .context_resolver
+                    .add_list(remaining.unwrap_or_default()),
+                Err(why) => {
+                    warn!("could not resolve a further context page: {why}");
+                    self.context_resolver.mark_next_unavailable();
+                }
+            }
+            self.context_resolver.remove_used_and_invalid();
+        }
 
         // load here, so that we clear the queue only after we definitely retrieved a new context
         self.connect_state.clear_next_tracks();
