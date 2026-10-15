@@ -1895,26 +1895,6 @@ async fn get_setup() -> Setup {
     }
 }
 
-/// Stops Connect and its session, as for a new login.
-fn stop<F: Future<Output = ()> + Send + 'static>(
-    spirc: &mut Option<Spirc>,
-    spirc_task: &mut Option<Pin<Box<F>>>,
-    session: &Session,
-) {
-    if let Some(spirc) = spirc.take() {
-        if let Err(e) = spirc.shutdown() {
-            error!("error sending spirc shutdown message: {e}");
-        }
-    }
-    if let Some(spirc_task) = spirc_task.take() {
-        // Continue shutdown in its own task
-        tokio::spawn(spirc_task);
-    }
-    if !session.is_invalid() {
-        session.shutdown();
-    }
-}
-
 // Initialize a static semaphore with only one permit, which is used to
 // prevent setting environment variables from running in parallel.
 static PERMIT: Semaphore = Semaphore::const_new(1);
@@ -2114,8 +2094,22 @@ async fn main() {
                     Some(credentials) => {
                         last_credentials = Some(credentials.clone());
                         auto_connect_times.clear();
-                        stop(&mut spirc, &mut spirc_task, &session);
+
+                        if let Some(spirc) = spirc.take() {
+                            if let Err(e) = spirc.shutdown() {
+                                error!("error sending spirc shutdown message: {e}");
+                            }
+                        }
+                        if let Some(spirc_task) = spirc_task.take() {
+                            // Continue shutdown in its own task
+                            tokio::spawn(spirc_task);
+                        }
+                        if !session.is_invalid() {
+                            session.shutdown();
+                        }
+
                         connecting = true;
+                        q2browse::forget_throttling();
                         link.send_replace(q2browse::Link::Connecting);
                     },
                     None => {
@@ -2124,16 +2118,17 @@ async fn main() {
                     }
                 }
             },
-            Some(done) = signout_requests.recv() => {
+            Some((done, flushed)) = signout_requests.recv() => {
                 info!("Signing out");
-                stop(&mut spirc, &mut spirc_task, &session);
+                link.send_replace(q2browse::Link::Login);
                 if let Some(Err(e)) = setup.cache.as_ref().map(Cache::remove_credentials) {
                     error!("Could not remove the saved login: {e}");
                 }
-                last_credentials = None;
-                connecting = false;
-                link.send_replace(q2browse::Link::Login);
                 let _ = done.send(());
+                // A fresh process forgets the login everywhere, discovery's included: once the
+                // reply is out, shut down as on Ctrl-C (playback stops) and the launcher restarts us.
+                let _ = tokio::time::timeout(Duration::from_secs(5), flushed).await;
+                break;
             },
             _ = async {}, if connecting && last_credentials.is_some() => {
                 if session.is_invalid() {

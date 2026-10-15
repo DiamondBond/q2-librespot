@@ -2,18 +2,29 @@
 //! response per connection, described in q2-pod's docs/librespot.md. It shares the main loop's
 //! session and Spirc, and keeps nothing between requests: cursors carry the paging state.
 
-use futures_util::{StreamExt, stream};
 use librespot::{
-    connect::{LoadRequest, LoadRequestOptions, PlayingTrack, Spirc},
-    core::{Error, Session, SpotifyId, SpotifyUri, error::ErrorKind, http_client::HttpClientError},
+    connect::{LoadRequest, LoadRequestOptions, PlayingTrack, QueueState, Spirc},
+    core::{Error, Session, SpotifyUri, error::ErrorKind, http_client::HttpClientError},
     metadata::{Album, Artist, Metadata, Track, artist::Artists},
-    protocol::{collection2v2::PageResponse, playlist4_external::SelectedListContent},
+    protocol::{
+        collection2v2::PageResponse,
+        extended_metadata::{
+            BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
+        },
+        extension_kind::ExtensionKind,
+        playlist4_external::SelectedListContent,
+    },
 };
 use log::{error, warn};
 use protobuf::Message;
 use std::{
+    collections::HashMap,
+    ops::Range,
     path::Path,
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -37,8 +48,7 @@ const DEADLINE: Duration = Duration::from_secs(14);
 const PAGING_BUDGET: Duration = Duration::from_secs(10);
 /// Throttled without a Retry-After: hold off this long.
 const THROTTLE_DEFAULT: Duration = Duration::from_secs(30);
-/// Metadata lookups in flight per request.
-const LOOKUPS: usize = 8;
+const THROTTLE_MAX: Duration = Duration::from_secs(3600);
 
 /// Ops with their minimum and maximum argument counts.
 const OPS: [(&str, usize, usize); 18] = [
@@ -52,7 +62,7 @@ const OPS: [(&str, usize, usize); 18] = [
     ("album", 1, 2),
     ("artist", 1, 1),
     ("search", 2, 3),
-    ("play", 1, 2),
+    ("play", 1, 3),
     ("queue", 0, 0),
     ("skip", 2, 2),
     ("enqueue", 1, 1),
@@ -61,8 +71,18 @@ const OPS: [(&str, usize, usize); 18] = [
     ("repeat", 1, 1),
     ("signout", 0, 0),
 ];
+/// Ops a newer request never aborts.
+const MUTATING: [&str; 6] = ["play", "skip", "enqueue", "shuffle", "repeat", "signout"];
 
-static THROTTLED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Throttle deadlines: spclient, and Pathfinder (search) on its own host.
+static THROTTLED: Mutex<[Option<Instant>; 2]> = Mutex::new([None; 2]);
+const SPCLIENT: usize = 0;
+const PATHFINDER: usize = 1;
+
+/// Forgets throttling, as for another account.
+pub fn forget_throttling() {
+    *THROTTLED.lock().unwrap() = [None; 2];
+}
 
 /// What the browser can reach, kept current by the main loop.
 #[derive(Clone)]
@@ -73,8 +93,9 @@ pub enum Link {
     Ready(Session, Spirc),
 }
 
-/// Asks the main loop to sign out; it answers once the login is gone.
-pub type Signout = mpsc::UnboundedSender<oneshot::Sender<()>>;
+/// Asks the main loop to sign out: it answers on the first channel once the login is gone,
+/// then exits when the second is dropped, after the reply went out.
+pub type Signout = mpsc::UnboundedSender<(oneshot::Sender<()>, oneshot::Receiver<()>)>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Status {
@@ -92,35 +113,20 @@ enum Status {
 }
 
 impl Status {
-    fn name(self) -> &'static str {
+    /// The wire name and the default message.
+    fn text(self) -> (&'static str, &'static str) {
         match self {
-            Status::Ok => "ok",
-            Status::Login => "login",
-            Status::Offline => "offline",
-            Status::Premium => "premium",
-            Status::Refused => "refused",
-            Status::Unavailable => "unavailable",
-            Status::Stale => "stale",
-            Status::Throttled => "throttled",
-            Status::Unsupported => "unsupported",
-            Status::Bad => "bad",
-            Status::Error => "error",
-        }
-    }
-
-    fn message(self) -> &'static str {
-        match self {
-            Status::Ok => "",
-            Status::Login => "Open Spotify on your phone and choose Q2",
-            Status::Offline => "Spotify can't be reached",
-            Status::Premium => "Spotify Premium is required",
-            Status::Refused => "Spotify refused the login",
-            Status::Unavailable => "Not available",
-            Status::Stale => "Search needs an add-on update",
-            Status::Throttled => "Spotify is busy, try again later",
-            Status::Unsupported => "Not supported by this add-on",
-            Status::Bad => "Bad request",
-            Status::Error => "Spotify request failed",
+            Status::Ok => ("ok", ""),
+            Status::Login => ("login", "Open Spotify on your phone and choose Q2"),
+            Status::Offline => ("offline", "Spotify can't be reached"),
+            Status::Premium => ("premium", "Spotify Premium is required"),
+            Status::Refused => ("refused", "Spotify refused the login"),
+            Status::Unavailable => ("unavailable", "Not available"),
+            Status::Stale => ("stale", "Search needs an add-on update"),
+            Status::Throttled => ("throttled", "Spotify is busy, try again later"),
+            Status::Unsupported => ("unsupported", "Not supported by this add-on"),
+            Status::Bad => ("bad", "Bad request"),
+            Status::Error => ("error", "Spotify request failed"),
         }
     }
 }
@@ -129,11 +135,7 @@ impl Status {
 struct Fail(Status, String);
 
 fn fail(status: Status) -> Fail {
-    Fail(status, status.message().into())
-}
-
-fn fail_with(status: Status, message: &str) -> Fail {
-    Fail(status, message.into())
+    Fail(status, status.text().1.into())
 }
 
 /// The status for a failed Spotify request, and how long a 429 asked us to wait.
@@ -164,17 +166,22 @@ fn classify(e: &Error) -> (Status, Option<Duration>) {
     }
 }
 
+/// The answer for a failed request to the `host` throttle bucket; a 429 holds that host off.
+fn failed(e: Error, host: usize) -> Fail {
+    // Error's text holds no tokens: a kind and a status code or I/O cause
+    warn!("Browse request failed: {e}");
+    let (status, wait) = classify(&e);
+    if status != Status::Throttled {
+        return fail(status);
+    }
+    let wait = wait.unwrap_or(THROTTLE_DEFAULT).min(THROTTLE_MAX);
+    THROTTLED.lock().unwrap()[host] = Some(Instant::now() + wait);
+    throttled(wait)
+}
+
 impl From<Error> for Fail {
     fn from(e: Error) -> Self {
-        // Error's text holds no tokens: a kind and a status code or I/O cause
-        warn!("Browse request failed: {e}");
-        let (status, wait) = classify(&e);
-        if status == Status::Throttled {
-            let wait = wait.unwrap_or(THROTTLE_DEFAULT);
-            *THROTTLED_UNTIL.lock().unwrap() = Some(Instant::now() + wait);
-            return throttled(wait);
-        }
-        fail(status)
+        failed(e, SPCLIENT)
     }
 }
 
@@ -183,7 +190,7 @@ fn throttled(wait: Duration) -> Fail {
     Fail(Status::Throttled, message)
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Row {
     kind: &'static str,
     uri: String,
@@ -204,7 +211,8 @@ struct Page {
 
 // Framing
 
-fn escape(s: &str, out: &mut String) {
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '%' => out.push_str("%25"),
@@ -214,18 +222,16 @@ fn escape(s: &str, out: &mut String) {
             c => out.push(c),
         }
     }
+    out
 }
 
 fn unescape(field: &[u8]) -> Option<String> {
+    let hex = |b: Option<&u8>| (*b? as char).to_digit(16);
     let mut out = Vec::with_capacity(field.len());
     let mut bytes = field.iter();
     while let Some(&b) = bytes.next() {
         if b == b'%' {
-            let hex = [*bytes.next()?, *bytes.next()?];
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+            out.push((hex(bytes.next())? * 16 + hex(bytes.next())?) as u8);
         } else {
             out.push(b);
         }
@@ -285,13 +291,22 @@ fn parse(buf: &[u8]) -> Result<Request, String> {
 }
 
 /// The response, with as many rows as fit in 64 KiB; a page cut short continues after its last row.
-fn encode(id: &str, status: Status, message: &str, page: &Page) -> Vec<u8> {
+fn encode(id: &str, result: Result<Page, Fail>) -> Vec<u8> {
+    let (status, page) = match result {
+        Ok(page) => (Status::Ok, page),
+        Err(Fail(status, message)) => (
+            status,
+            Page {
+                message,
+                ..Default::default()
+            },
+        ),
+    };
     let mut rows = String::new();
     let mut cursor = page.cursor.as_str();
     // room for the header with the longest cursor
     let budget = MAX_RESPONSE - (MAGIC.len() + id.len() + 3 * (MAX_MESSAGE + MAX_CURSOR) + 32);
     for (i, row) in page.rows.iter().enumerate() {
-        let mut line = String::new();
         let position = row.position.map(|p| p.to_string()).unwrap_or_default();
         let fields = [
             row.kind,
@@ -301,34 +316,32 @@ fn encode(id: &str, status: Status, message: &str, page: &Page) -> Vec<u8> {
             &row.context,
             &position,
         ];
-        for (j, field) in fields.iter().enumerate() {
-            if j > 0 {
-                line.push('\t');
-            }
-            escape(field, &mut line);
-        }
-        line.push('\n');
+        let line = fields.map(escape).join("\t") + "\n";
         if rows.len() + line.len() > budget {
-            cursor = page.rows[..i].last().map_or("", |row| row.after.as_str());
+            match page.rows[..i].last() {
+                Some(row) if !row.after.is_empty() => cursor = &row.after,
+                _ => return encode(id, Err(Fail(Status::Error, "Page too large".into()))),
+            }
             break;
         }
         rows.push_str(&line);
     }
     if cursor.len() > MAX_CURSOR {
-        return encode(id, Status::Error, "Cursor too long", &Page::default());
+        return encode(id, Err(Fail(Status::Error, "Cursor too long".into())));
     }
-    let mut out = format!("{MAGIC}\n{id}\t{}\t", status.name());
-    escape(cut(message, MAX_MESSAGE), &mut out);
-    out.push('\t');
-    escape(cursor, &mut out);
-    out.push('\n');
-    out.push_str(&rows);
-    out.into_bytes()
+    format!(
+        "{MAGIC}\n{id}\t{}\t{}\t{}\n{rows}",
+        status.text().0,
+        escape(cut(&page.message, MAX_MESSAGE)),
+        escape(cursor)
+    )
+    .into_bytes()
 }
 
 // Serving
 
-/// Binds `path` and answers each connection in its own task.
+/// Binds `path` and answers each connection in its own task. A new connection aborts the
+/// previous read-only request: the client has given up on it.
 pub fn serve(path: &Path, link: watch::Receiver<Link>, signout: Signout) {
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
@@ -336,10 +349,23 @@ pub fn serve(path: &Path, link: watch::Receiver<Link>, signout: Signout) {
         Err(e) => return error!("Could not bind {}: {e}", path.display()),
     };
     tokio::spawn(async move {
+        let mut last: Option<(tokio::task::AbortHandle, Arc<AtomicBool>)> = None;
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    tokio::spawn(answer(stream, link.clone(), signout.clone()));
+                    if let Some((task, abortable)) = last.take() {
+                        if abortable.load(Ordering::Relaxed) {
+                            task.abort();
+                        }
+                    }
+                    let abortable = Arc::new(AtomicBool::new(false));
+                    let task = tokio::spawn(answer(
+                        stream,
+                        link.clone(),
+                        signout.clone(),
+                        abortable.clone(),
+                    ));
+                    last = Some((task.abort_handle(), abortable));
                 }
                 Err(e) => {
                     warn!("Browse socket: {e}");
@@ -350,46 +376,48 @@ pub fn serve(path: &Path, link: watch::Receiver<Link>, signout: Signout) {
     });
 }
 
-async fn answer(mut stream: UnixStream, mut link: watch::Receiver<Link>, signout: Signout) {
+async fn answer(
+    mut stream: UnixStream,
+    mut link: watch::Receiver<Link>,
+    signout: Signout,
+    abortable: Arc<AtomicBool>,
+) {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let mut buf = Vec::new();
-    let read = async {
-        let mut chunk = [0u8; 1024];
-        // to EOF, the request line's newline, or one byte past the limit
-        while buf.len() <= MAX_REQUEST && buf.iter().filter(|&&b| b == b'\n').count() < 2 {
-            match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        }
-    };
-    if tokio::time::timeout_at(deadline, read).await.is_err() {
+    // the client shuts down its write side after the request; one byte past the limit is `bad`
+    let mut limited = (&mut stream).take(MAX_REQUEST as u64 + 1);
+    let read = limited.read_to_end(&mut buf);
+    if !matches!(tokio::time::timeout_at(deadline, read).await, Ok(Ok(_))) {
         return;
     }
-    let response = match parse(&buf) {
-        Err(id) => encode(&id, Status::Bad, Status::Bad.message(), &Page::default()),
+    // held until the reply is out: dropping it lets a sign out exit
+    let mut flushed = None;
+    let (id, result) = match parse(&buf) {
+        Err(id) => (id, Err(fail(Status::Bad))),
         Ok(request) => {
-            let result = tokio::time::timeout_at(deadline, run(&request, &mut link, &signout))
+            abortable.store(!MUTATING.contains(&request.op.as_str()), Ordering::Relaxed);
+            let run = run(&request, &mut link, &signout, &mut flushed);
+            let result = tokio::time::timeout_at(deadline, run)
                 .await
                 .unwrap_or_else(|_| {
-                    Err(fail_with(Status::Offline, "Spotify didn't answer in time"))
+                    Err(Fail(
+                        Status::Offline,
+                        "Spotify didn't answer in time".into(),
+                    ))
                 });
-            match result {
-                Ok(page) => encode(&request.id, Status::Ok, &page.message, &page),
-                Err(Fail(status, message)) => {
-                    encode(&request.id, status, &message, &Page::default())
-                }
-            }
+            (request.id, result)
         }
     };
-    let _ = stream.write_all(&response).await;
+    let _ = stream.write_all(&encode(&id, result)).await;
     let _ = stream.shutdown().await;
+    drop(flushed);
 }
 
 async fn run(
     request: &Request,
     link: &mut watch::Receiver<Link>,
     signout: &Signout,
+    flushed: &mut Option<oneshot::Sender<()>>,
 ) -> Result<Page, Fail> {
     let Request { op, args, .. } = request;
     let Some(&(_, min, max)) = OPS.iter().find(|(name, ..)| name == op) else {
@@ -399,20 +427,31 @@ async fn run(
         return Err(fail(Status::Bad));
     }
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_default();
-    // the optional cursor or position is the last argument
-    let last = args.get(min).map(String::as_str).unwrap_or_default();
+    // the optional cursor or position follows the required arguments
+    let last = arg(min);
     match op.as_str() {
         "caps" => return Ok(caps()),
         "signout" => {
             let (done, signed_out) = oneshot::channel();
-            signout.send(done).map_err(|_| fail(Status::Error))?;
+            let (flushed_tx, flushed_rx) = oneshot::channel();
+            *flushed = Some(flushed_tx);
+            signout
+                .send((done, flushed_rx))
+                .map_err(|_| fail(Status::Error))?;
             signed_out.await.map_err(|_| fail(Status::Error))?;
             return Ok(Page::default());
         }
         _ => {}
     }
     let (session, spirc) = ready(link).await?;
-    if let Some(until) = *THROTTLED_UNTIL.lock().unwrap() {
+    // only ops that ask Spotify's web APIs wait out a throttle; Connect commands never do
+    let host = match op.as_str() {
+        "search" => Some(PATHFINDER),
+        "account" | "playlists" | "playlist" | "liked" | "albums" | "artists" | "album"
+        | "artist" => Some(SPCLIENT),
+        _ => None,
+    };
+    if let Some(until) = host.and_then(|host| THROTTLED.lock().unwrap()[host]) {
         let now = Instant::now();
         if until > now {
             return Err(throttled(until - now));
@@ -428,7 +467,7 @@ async fn run(
         "album" => album(&session, arg(0), offset(last)?).await,
         "artist" => artist(&session, arg(0)).await,
         "search" => search(&session, arg(0), arg(1), offset(last)?).await,
-        "play" => play(&spirc, arg(0), last),
+        "play" => play(&spirc, arg(0), last, arg(2)).await,
         "queue" => queue(&session, &spirc).await,
         "skip" => skip(&spirc, arg(0), arg(1)).await,
         "enqueue" => enqueue(&spirc, arg(0)).await,
@@ -459,86 +498,110 @@ fn offset(cursor: &str) -> Result<usize, Fail> {
     }
 }
 
+/// The base62 id of a `spotify:<kind>:<id>` URI.
 fn uri_of<'a>(uri: &'a str, kind: &str) -> Result<&'a str, Fail> {
-    match uri
-        .strip_prefix("spotify:")
-        .and_then(|r| r.strip_prefix(kind))
-    {
-        Some(id) if id.starts_with(':') => Ok(uri),
-        _ => Err(fail(Status::Bad)),
-    }
+    uri.strip_prefix("spotify:")
+        .and_then(|r| r.strip_prefix(kind)?.strip_prefix(':'))
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .ok_or_else(|| fail(Status::Bad))
 }
 
 fn names(artists: &Artists) -> String {
-    let names: Vec<_> = artists.iter().map(|a| a.name.as_str()).collect();
-    names.join(", ")
+    artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Metadata for each URI, in order; `None` for an item that is gone.
-async fn lookup<T: Metadata>(session: &Session, uris: &[String]) -> Result<Vec<Option<T>>, Fail> {
-    // owned values: borrowed ones here make the task's future not Send
-    let results: Vec<Result<T, Error>> = stream::iter(uris.to_vec())
-        .map(|uri| {
-            let session = session.clone();
-            async move { T::get(&session, &SpotifyUri::from_uri(&uri)?).await }
-        })
-        .buffered(LOOKUPS)
-        .collect()
-        .await;
-    results
+/// The items in one batched extended-metadata response, by URI. An item that doesn't parse
+/// is left out and logged.
+fn parse_items<T: Metadata>(response: BatchedExtensionResponse) -> HashMap<String, T> {
+    let mut items = HashMap::new();
+    for data in response
+        .extended_metadata
         .into_iter()
-        .map(|result| match result {
-            Ok(item) => Ok(Some(item)),
-            Err(e) if classify(&e).0 == Status::Unavailable => Ok(None),
-            Err(e) => Err(e.into()),
-        })
-        .collect()
+        .flat_map(|a| a.extension_data)
+    {
+        let item = SpotifyUri::from_uri(&data.entity_uri).and_then(|id| {
+            T::parse(
+                &T::Message::parse_from_bytes(&data.extension_data.value)?,
+                &id,
+            )
+        });
+        match item {
+            Ok(item) => drop(items.insert(data.entity_uri, item)),
+            Err(e) => warn!("Browse: leaving out {}: {e}", data.entity_uri),
+        }
+    }
+    items
 }
 
-/// Track rows for (uri, position, after) entries, all in `context`.
-async fn track_rows(
+/// Titles and subtitles for the rows from one metadata request; rows whose item is gone drop out.
+async fn fill<T: Metadata>(
     session: &Session,
-    entries: Vec<(String, Option<usize>, String)>,
-    context: &str,
+    kind: ExtensionKind,
+    rows: Vec<Row>,
+    show: impl Fn(&T) -> (String, String),
 ) -> Result<Vec<Row>, Fail> {
-    let uris: Vec<_> = entries.iter().map(|e| e.0.clone()).collect();
-    let tracks = lookup::<Track>(session, &uris).await?;
-    Ok(entries
-        .into_iter()
-        .zip(tracks)
-        .filter_map(|((uri, position, after), track)| {
-            let track = track?;
-            Some(Row {
-                kind: "track",
-                uri,
-                title: track.name,
-                subtitle: names(&track.artists),
-                context: context.into(),
-                position,
-                after,
-            })
-        })
-        .collect())
-}
-
-async fn album_rows(session: &Session, entries: Vec<(String, String)>) -> Result<Vec<Row>, Fail> {
-    let uris: Vec<_> = entries.iter().map(|e| e.0.clone()).collect();
-    let albums = lookup::<Album>(session, &uris).await?;
-    Ok(entries
-        .into_iter()
-        .zip(albums)
-        .filter_map(|((uri, after), album)| {
-            let album = album?;
-            Some(Row {
-                kind: "album",
-                uri,
-                title: album.name,
-                subtitle: names(&album.artists),
-                after,
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+    let mut uris: Vec<_> = rows.iter().map(|row| row.uri.clone()).collect();
+    uris.sort();
+    uris.dedup();
+    let request = BatchedEntityRequest {
+        entity_request: uris
+            .into_iter()
+            .map(|entity_uri| EntityRequest {
+                entity_uri,
+                query: vec![ExtensionQuery {
+                    extension_kind: kind.into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             })
+            .collect(),
+        ..Default::default()
+    };
+    let response = session.spclient().get_extended_metadata(request).await?;
+    let items = parse_items::<T>(response);
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let (title, subtitle) = show(items.get(&row.uri)?);
+            Some(Row {
+                title,
+                subtitle,
+                ..row
+            })
         })
         .collect())
+}
+
+async fn tracks(session: &Session, rows: Vec<Row>) -> Result<Vec<Row>, Fail> {
+    fill(session, ExtensionKind::TRACK_V4, rows, |t: &Track| {
+        (t.name.clone(), names(&t.artists))
+    })
+    .await
+}
+
+async fn albums(session: &Session, rows: Vec<Row>) -> Result<Vec<Row>, Fail> {
+    fill(session, ExtensionKind::ALBUM_V4, rows, |a: &Album| {
+        (a.name.clone(), names(&a.artists))
+    })
+    .await
+}
+
+fn row(kind: &'static str, uri: String, context: &str, position: Option<usize>) -> Row {
+    Row {
+        kind,
+        uri,
+        context: context.into(),
+        position,
+        after: position.map(|p| (p + 1).to_string()).unwrap_or_default(),
+        ..Default::default()
+    }
 }
 
 // Ops
@@ -547,14 +610,10 @@ fn caps() -> Page {
     Page {
         rows: OPS
             .iter()
-            .map(|(name, ..)| Row {
-                kind: "op",
-                uri: name.to_string(),
-                ..Default::default()
-            })
+            .map(|(name, ..)| row("op", name.to_string(), "", None))
             .collect(),
-        cursor: String::new(),
         message: VERSION.into(),
+        ..Default::default()
     }
 }
 
@@ -571,7 +630,12 @@ async fn account(session: &Session) -> Result<Page, Fail> {
     match product.as_deref() {
         Some("premium") => {}
         Some(_) => return Err(fail(Status::Premium)),
-        None => return Err(fail_with(Status::Error, "No account details from Spotify")),
+        None => {
+            return Err(Fail(
+                Status::Error,
+                "No account details from Spotify".into(),
+            ));
+        }
     }
     let username = session.username();
     let profile = session
@@ -586,51 +650,50 @@ async fn account(session: &Session) -> Result<Page, Fail> {
         .unwrap_or_else(|| username.clone());
     Ok(Page {
         rows: vec![Row {
-            kind: "account",
-            uri: format!("spotify:user:{username}"),
             title: name,
             subtitle: "Premium".into(),
-            ..Default::default()
+            ..row("account", format!("spotify:user:{username}"), "", None)
         }],
         ..Default::default()
     })
 }
 
-/// The items from `from` of a playlist or the rootlist, whether or not the server began there.
-fn window(list: &SelectedListContent, from: usize) -> (Vec<(usize, usize)>, String) {
-    let base = list.contents.pos() as usize;
+/// An offset cursor, or none at the end.
+fn cursor_at(next: usize, more: bool) -> String {
+    if more {
+        next.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Where a playlist or rootlist response begins in the list.
+fn base(list: &SelectedListContent) -> usize {
+    list.contents.pos().max(0) as usize
+}
+
+/// The response's items from `from`, whether or not the server began there, and the cursor.
+fn window(list: &SelectedListContent, from: usize) -> (Range<usize>, String) {
     let items = list.contents.items.len();
-    let start = from.saturating_sub(base).min(items);
-    let end = (start + PAGE).min(items);
-    // (index in this response, index in the list)
-    let taken: Vec<_> = (start..end).map(|i| (i, base + i)).collect();
-    let next = base + end;
-    let more = end > start && next < list.length() as usize;
-    (
-        taken,
-        if more {
-            next.to_string()
-        } else {
-            String::new()
-        },
-    )
+    let start = from.saturating_sub(base(list)).min(items);
+    let end = start.saturating_add(PAGE).min(items);
+    let next = base(list) + end;
+    let more = end > start && next < list.length().max(0) as usize;
+    (start..end, cursor_at(next, more))
 }
 
 fn playlist_rows(list: &SelectedListContent, from: usize) -> Page {
     let (taken, cursor) = window(list, from);
     let contents = &list.contents;
     let rows = taken
-        .into_iter()
-        .filter(|&(i, _)| contents.items[i].uri().starts_with("spotify:playlist:"))
-        .map(|(i, index)| {
+        .filter(|&i| contents.items[i].uri().starts_with("spotify:playlist:"))
+        .map(|i| {
             let meta = contents.meta_items.get(i);
             Row {
-                kind: "playlist",
-                uri: contents.items[i].uri().into(),
                 title: meta.map(|m| m.attributes.name().into()).unwrap_or_default(),
                 subtitle: meta.map(|m| m.owner_username().into()).unwrap_or_default(),
-                after: (index + 1).to_string(),
-                ..Default::default()
+                after: (base(list) + i + 1).to_string(),
+                ..row("playlist", contents.items[i].uri().into(), "", None)
             }
         })
         .collect();
@@ -647,64 +710,53 @@ async fn playlists(session: &Session, from: usize) -> Result<Page, Fail> {
     Ok(playlist_rows(&list, from))
 }
 
-/// A playlist's playable entries from `from`: (uri, index in the playlist, after).
-fn playlist_tracks(
-    list: &SelectedListContent,
-    from: usize,
-) -> (Vec<(String, Option<usize>, String)>, String) {
+/// A playlist's track rows from `from`, positioned by their index in the playlist.
+fn playlist_tracks(list: &SelectedListContent, from: usize, context: &str) -> Page {
     let (taken, cursor) = window(list, from);
-    let entries = taken
-        .into_iter()
-        .map(|(i, index)| (list.contents.items[i].uri().to_owned(), index))
+    let rows = taken
+        .map(|i| (list.contents.items[i].uri(), base(list) + i))
         .filter(|(uri, _)| uri.starts_with("spotify:track:"))
-        .map(|(uri, index)| (uri, Some(index), (index + 1).to_string()))
+        .map(|(uri, index)| row("track", uri.into(), context, Some(index)))
         .collect();
-    (entries, cursor)
+    Page {
+        rows,
+        cursor,
+        ..Default::default()
+    }
 }
 
 async fn playlist(session: &Session, uri: &str, from: usize) -> Result<Page, Fail> {
-    let id = uri_of(uri, "playlist")?
-        .rsplit(':')
-        .next()
-        .unwrap_or_default();
-    let id = SpotifyId::from_base62(id).map_err(|_| fail(Status::Bad))?;
-    let endpoint = format!(
-        "/playlist/v2/playlist/{}?from={from}&length={PAGE}",
-        id.to_base62()?
-    );
+    let id = uri_of(uri, "playlist")?;
+    let endpoint = format!("/playlist/v2/playlist/{id}?from={from}&length={PAGE}");
     let bytes = session
         .spclient()
         .request(&http::Method::GET, &endpoint, None, None)
         .await?;
     let list = SelectedListContent::parse_from_bytes(&bytes).map_err(|_| fail(Status::Error))?;
-    let (entries, cursor) = playlist_tracks(&list, from);
+    let page = playlist_tracks(&list, from, uri);
     Ok(Page {
-        rows: track_rows(session, entries, uri).await?,
-        cursor,
-        ..Default::default()
+        rows: tracks(session, page.rows).await?,
+        ..page
     })
 }
 
 /// A walk through a collection v2 set. Its cursor is `position.skip.token`: the next row's
 /// position, the matching items of the token's page already sent, and that page's token.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default)]
 struct Walk {
     prefix: &'static str,
     position: usize,
     skip: usize,
     token: String,
-    /// (uri, position, after)
-    found: Vec<(String, usize, String)>,
+    /// Rows with their position and `after` set.
+    found: Vec<Row>,
 }
 
 impl Walk {
     fn new(cursor: &str, prefix: &'static str) -> Result<Walk, Fail> {
         let mut walk = Walk {
             prefix,
-            position: 0,
-            skip: 0,
-            token: String::new(),
-            found: Vec::new(),
+            ..Default::default()
         };
         if !cursor.is_empty() {
             let mut parts = cursor.splitn(3, '.');
@@ -740,10 +792,14 @@ impl Walk {
             if self.found.len() == PAGE {
                 return Some(self.cursor(matched - 1));
             }
-            self.position += 1;
-            let after = self.cursor(matched);
-            self.found
-                .push((item.uri.clone(), self.position - 1, after));
+            let position = self.position;
+            self.position = position.saturating_add(1);
+            self.found.push(Row {
+                uri: item.uri.clone(),
+                position: Some(position),
+                after: self.cursor(matched),
+                ..Default::default()
+            });
         }
         self.skip = 0;
         self.token = page.next_page_token.clone();
@@ -779,33 +835,37 @@ async fn collection(session: &Session, mut walk: Walk) -> Result<Page, Fail> {
     let rows = match walk.prefix {
         "spotify:track:" => {
             let context = format!("spotify:user:{}:collection", session.username());
-            let entries = walk
-                .found
-                .into_iter()
-                .map(|(uri, position, after)| (uri, Some(position), after))
-                .collect();
-            track_rows(session, entries, &context).await?
+            let found = walk.found.into_iter();
+            let rows = found.map(|r| Row {
+                kind: "track",
+                context: context.clone(),
+                ..r
+            });
+            tracks(session, rows.collect()).await?
         }
         "spotify:album:" => {
-            let entries = walk.found.into_iter().map(|(uri, _, after)| (uri, after));
-            album_rows(session, entries.collect()).await?
+            let found = walk.found.into_iter();
+            let rows = found.map(|r| Row {
+                kind: "album",
+                position: None,
+                ..r
+            });
+            albums(session, rows.collect()).await?
         }
         _ => {
-            let uris: Vec<_> = walk.found.iter().map(|f| f.0.clone()).collect();
-            let artists = lookup::<Artist>(session, &uris).await?;
-            walk.found
-                .into_iter()
-                .zip(artists)
-                .filter_map(|((uri, _, after), artist)| {
-                    Some(Row {
-                        kind: "artist",
-                        uri,
-                        title: artist?.name,
-                        after,
-                        ..Default::default()
-                    })
-                })
-                .collect()
+            let found = walk.found.into_iter();
+            let rows = found.map(|r| Row {
+                kind: "artist",
+                position: None,
+                ..r
+            });
+            fill(
+                session,
+                ExtensionKind::ARTIST_V4,
+                rows.collect(),
+                |a: &Artist| (a.name.clone(), String::new()),
+            )
+            .await?
         }
     };
     Ok(Page {
@@ -816,39 +876,36 @@ async fn collection(session: &Session, mut walk: Walk) -> Result<Page, Fail> {
 }
 
 async fn album(session: &Session, uri: &str, from: usize) -> Result<Page, Fail> {
-    let album = Album::get(session, &SpotifyUri::from_uri(uri_of(uri, "album")?)?).await?;
-    let tracks: Vec<_> = album.tracks().collect();
-    let end = (from + PAGE).min(tracks.len());
-    let mut entries = Vec::new();
-    for (index, track) in tracks.iter().enumerate().take(end).skip(from) {
-        entries.push((track.to_uri()?, Some(index), (index + 1).to_string()));
+    uri_of(uri, "album")?;
+    let album = Album::get(session, &SpotifyUri::from_uri(uri)?).await?;
+    let ids: Vec<_> = album.tracks().collect();
+    let end = from.saturating_add(PAGE).min(ids.len());
+    let mut rows = Vec::new();
+    for (index, id) in ids.iter().enumerate().take(end).skip(from) {
+        rows.push(row("track", id.to_uri()?, uri, Some(index)));
     }
-    let cursor = if end < tracks.len() {
-        end.to_string()
-    } else {
-        String::new()
-    };
     Ok(Page {
-        rows: track_rows(session, entries, uri).await?,
-        cursor,
+        rows: tracks(session, rows).await?,
+        cursor: cursor_at(end, end < ids.len()),
         ..Default::default()
     })
 }
 
 async fn artist(session: &Session, uri: &str) -> Result<Page, Fail> {
-    let artist = Artist::get(session, &SpotifyUri::from_uri(uri_of(uri, "artist")?)?).await?;
+    uri_of(uri, "artist")?;
+    let artist = Artist::get(session, &SpotifyUri::from_uri(uri)?).await?;
     // ponytail: top tracks play on their own; an artist context is unverified on Connect
-    let mut tracks = Vec::new();
+    let mut top = Vec::new();
     for track in artist.top_tracks.for_country(&session.country()).iter() {
-        tracks.push((track.to_uri()?, None, String::new()));
+        top.push(row("track", track.to_uri()?, "", None));
     }
-    let mut albums = Vec::new();
+    let mut releases = Vec::new();
     for album in artist.albums_current().chain(artist.singles_current()) {
-        albums.push((album.to_uri()?, String::new()));
+        releases.push(row("album", album.to_uri()?, "", None));
     }
-    albums.truncate(PAGE.saturating_sub(tracks.len()));
-    let mut rows = track_rows(session, tracks, "").await?;
-    rows.extend(album_rows(session, albums).await?);
+    releases.truncate(PAGE.saturating_sub(top.len()));
+    let mut rows = tracks(session, top).await?;
+    rows.extend(albums(session, releases).await?);
     Ok(Page {
         rows,
         ..Default::default()
@@ -871,7 +928,8 @@ async fn search(session: &Session, category: &str, term: &str, from: usize) -> R
     let answer = session
         .spclient()
         .pathfinder_query("searchDesktop", SEARCH_HASH, variables)
-        .await?;
+        .await
+        .map_err(|e| failed(e, PATHFINDER))?;
     search_rows(&answer, category, from)
 }
 
@@ -908,63 +966,69 @@ fn search_rows(answer: &serde_json::Value, category: &str, from: usize) -> Resul
                 _ => (text(&data["name"]), text(&data["ownerV2"]["data"]["name"])),
             };
             Some(Row {
-                kind,
-                uri: uri.into(),
                 title,
                 subtitle,
-                after: (from + i + 1).to_string(),
-                ..Default::default()
+                after: from.saturating_add(i + 1).to_string(),
+                ..row(kind, uri.into(), "", None)
             })
         })
         .collect();
-    let next = from + items.len();
+    let next = from.saturating_add(items.len());
     let total = section["totalCount"].as_u64().unwrap_or_default() as usize;
+    let more = !items.is_empty() && next < total;
     Ok(Page {
         rows,
-        cursor: if !items.is_empty() && next < total {
-            next.to_string()
-        } else {
-            String::new()
-        },
+        cursor: cursor_at(next, more),
         ..Default::default()
     })
 }
 
-fn play(spirc: &Spirc, context: &str, position: &str) -> Result<Page, Fail> {
-    if !context.starts_with("spotify:") {
+/// `play context [position [uri]]`: `uri` is the row's track, which Liked Songs start by.
+async fn play(spirc: &Spirc, context: &str, position: &str, uri: &str) -> Result<Page, Fail> {
+    if !context.starts_with("spotify:") || (!uri.is_empty() && uri_of(uri, "track").is_err()) {
         return Err(fail(Status::Bad));
     }
-    let mut options = LoadRequestOptions {
+    let playing_track = match position {
+        "" => None,
+        // Connect may order the collection unlike collection v2, and it holds no duplicates
+        _ if !uri.is_empty() && context.ends_with(":collection") => {
+            Some(PlayingTrack::Uri(uri.into()))
+        }
+        _ => Some(PlayingTrack::Index(
+            position.parse().map_err(|_| fail(Status::Bad))?,
+        )),
+    };
+    let options = LoadRequestOptions {
         start_playing: true,
+        playing_track,
         ..Default::default()
     };
-    let request = if !position.is_empty() {
-        let index = position.parse().map_err(|_| fail(Status::Bad))?;
-        options.playing_track = Some(PlayingTrack::Index(index));
-        LoadRequest::from_context_uri(context.into(), options)
-    } else if context.starts_with("spotify:track:") {
+    let request = if position.is_empty() && context.starts_with("spotify:track:") {
         LoadRequest::from_tracks(vec![context.into()], options)
     } else {
         LoadRequest::from_context_uri(context.into(), options)
     };
     spirc.activate()?;
-    spirc.load(request)?;
-    Ok(Page::default())
+    match spirc.load_checked(request).await? {
+        true => Ok(Page::default()),
+        false => Err(Fail(
+            Status::Unavailable,
+            "Spotify couldn't start that".into(),
+        )),
+    }
 }
 
 async fn queue(session: &Session, spirc: &Spirc) -> Result<Page, Fail> {
     let Some(state) = spirc.queue().await? else {
         return Ok(Page::default());
     };
-    let entries = state
-        .next
-        .into_iter()
-        .take(PAGE)
-        .enumerate()
-        .map(|(i, uri)| (uri, Some(i), String::new()))
-        .collect();
+    let next = state.next.into_iter().take(PAGE).enumerate();
+    let rows = next.map(|(i, uri)| Row {
+        after: String::new(),
+        ..row("track", uri, "", Some(i))
+    });
     Ok(Page {
-        rows: track_rows(session, entries, "").await?,
+        rows: tracks(session, rows.collect()).await?,
         ..Default::default()
     })
 }
@@ -973,32 +1037,32 @@ async fn skip(spirc: &Spirc, position: &str, uri: &str) -> Result<Page, Fail> {
     let position = position.parse().map_err(|_| fail(Status::Bad))?;
     match spirc.skip_to(position, uri.into()).await? {
         true => Ok(Page::default()),
-        false => Err(fail_with(Status::Unavailable, "The queue has changed")),
+        false => Err(Fail(Status::Unavailable, "The queue has changed".into())),
     }
 }
 
+fn not_playing() -> Fail {
+    Fail(Status::Unavailable, "Nothing is playing on Q2".into())
+}
+
 /// The play options, or `unavailable` while Q2 isn't playing (Connect then ignores them).
-async fn active(spirc: &Spirc) -> Result<librespot::connect::QueueState, Fail> {
-    spirc
-        .queue()
-        .await?
-        .ok_or_else(|| fail_with(Status::Unavailable, "Nothing is playing on Q2"))
+async fn active(spirc: &Spirc) -> Result<QueueState, Fail> {
+    spirc.queue().await?.ok_or_else(not_playing)
 }
 
 async fn enqueue(spirc: &Spirc, uri: &str) -> Result<Page, Fail> {
     uri_of(uri, "track")?;
-    active(spirc).await?;
-    spirc.add_to_queue(uri.into())?;
-    Ok(Page::default())
+    match spirc.add_to_queue(uri.into()).await? {
+        true => Ok(Page::default()),
+        false => Err(not_playing()),
+    }
 }
 
 async fn settings(spirc: &Spirc) -> Result<Page, Fail> {
     let state = active(spirc).await?;
     let setting = |name: &str, value: &str| Row {
-        kind: "setting",
-        uri: name.into(),
         title: value.into(),
-        ..Default::default()
+        ..row("setting", name.into(), "", None)
     };
     let repeat = match (state.repeat_track, state.repeat_context) {
         (true, _) => "track",
@@ -1042,6 +1106,9 @@ mod tests {
     use super::*;
     use librespot::protocol::{
         collection2v2::CollectionItem,
+        entity_extension_data::EntityExtensionData,
+        extended_metadata::EntityExtensionDataArray,
+        metadata,
         playlist4_external::{Item, ListAttributes, ListItems, MetaItem},
     };
 
@@ -1058,18 +1125,13 @@ mod tests {
     }
 
     fn track(uri: &str) -> Row {
-        Row {
-            kind: "track",
-            uri: uri.into(),
-            ..Default::default()
-        }
+        row("track", uri.into(), "", None)
     }
 
     #[test]
     fn escaping_round_trips() {
         let text = "50% tab\there\nline\rcr – ünïcødé 🎧";
-        let mut escaped = String::new();
-        escape(text, &mut escaped);
+        let escaped = escape(text);
         assert_eq!(escaped, "50%25 tab%09here%0Aline%0Dcr – ünïcødé 🎧");
         assert_eq!(unescape(escaped.as_bytes()).as_deref(), Some(text));
         assert_eq!(unescape(b"%41%e2%80%93").as_deref(), Some("A–"));
@@ -1100,8 +1162,7 @@ mod tests {
             })
         );
         // EOF without a newline is fine too
-        let unterminated = b"Q2SPOT/1\n8\tliked";
-        assert_eq!(parse(unterminated).unwrap().op, "liked");
+        assert_eq!(parse(b"Q2SPOT/1\n8\tliked").unwrap().op, "liked");
     }
 
     #[test]
@@ -1120,18 +1181,22 @@ mod tests {
     async fn ops_are_checked() {
         let (_tx, mut link) = watch::channel(Link::Login);
         let (signout, _rx) = mpsc::unbounded_channel();
+        let mut flushed = None;
         for (line, status) in [
             ("1\tdance", Status::Unsupported),
             ("2\tplaylist", Status::Bad),
             ("3\tskip\t1", Status::Bad),
             ("4\tliked", Status::Login),
+            ("5\tplay\tspotify:x\t1\turi\textra", Status::Bad),
         ] {
             let request = parse(&request(line)).unwrap();
-            let result = run(&request, &mut link, &signout).await;
+            let result = run(&request, &mut link, &signout, &mut flushed).await;
             assert_eq!(result.unwrap_err().0, status, "{line}");
         }
-        let request = parse(&request("5\tcaps")).unwrap();
-        let caps = run(&request, &mut link, &signout).await.unwrap();
+        let request = parse(&request("6\tcaps")).unwrap();
+        let caps = run(&request, &mut link, &signout, &mut flushed)
+            .await
+            .unwrap();
         assert_eq!(caps.message, VERSION);
         assert_eq!(caps.rows.len(), OPS.len());
     }
@@ -1140,50 +1205,54 @@ mod tests {
     fn responses_encode() {
         let page = Page {
             rows: vec![Row {
-                context: "spotify:user:alice:collection".into(),
-                position: Some(0),
                 title: "Song\tTitle".into(),
                 subtitle: "Band".into(),
-                ..track("spotify:track:1")
+                ..row(
+                    "track",
+                    "spotify:track:1".into(),
+                    "spotify:user:alice:collection",
+                    Some(0),
+                )
             }],
             cursor: "1.1.tok".into(),
             ..Default::default()
         };
         assert_eq!(
-            lines(&encode("7", Status::Ok, "", &page)),
+            lines(&encode("7", Ok(page))),
             [
                 "Q2SPOT/1",
                 "7\tok\t\t1.1.tok",
                 "track\tspotify:track:1\tSong%09Title\tBand\tspotify:user:alice:collection\t0"
             ]
         );
-        let error = encode(
-            "8",
-            Status::Offline,
-            Status::Offline.message(),
-            &Page::default(),
-        );
+        let error = encode("8", Err(fail(Status::Offline)));
         assert_eq!(lines(&error)[1], "8\toffline\tSpotify can't be reached\t");
+    }
+
+    fn heavy_rows(after: bool) -> Vec<Row> {
+        // escaping triples these titles: 50 rows would pass 64 KiB
+        (0..PAGE)
+            .map(|i| Row {
+                title: "%".repeat(400),
+                subtitle: "\t".repeat(400),
+                after: if after {
+                    (i + 1).to_string()
+                } else {
+                    String::new()
+                },
+                ..track("spotify:track:x")
+            })
+            .collect()
     }
 
     #[test]
     fn long_pages_are_cut_with_a_cursor() {
-        // escaping triples these titles: 50 rows would pass 64 KiB
-        let rows = (0..PAGE)
-            .map(|i| Row {
-                title: "%".repeat(400),
-                subtitle: "\t".repeat(400),
-                position: Some(i),
-                after: format!("{}", i + 1),
-                ..track("spotify:track:x")
-            })
-            .collect();
         let page = Page {
-            rows,
+            rows: heavy_rows(true),
             cursor: "50".into(),
             ..Default::default()
         };
-        let response = encode("1", Status::Ok, "", &page);
+        let response = encode("1", Ok(page));
         assert!(response.len() <= MAX_RESPONSE);
         let lines = lines(&response);
         let sent = lines.len() - 2;
@@ -1194,19 +1263,27 @@ mod tests {
     }
 
     #[test]
-    fn oversized_cursors_are_errors() {
+    fn pages_that_cannot_continue_are_errors() {
+        let page = Page {
+            rows: heavy_rows(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            lines(&encode("1", Ok(page)))[1],
+            "1\terror\tPage too large\t"
+        );
         let page = Page {
             cursor: "x".repeat(MAX_CURSOR + 1),
             ..Default::default()
         };
         assert_eq!(
-            lines(&encode("1", Status::Ok, "", &page))[1],
+            lines(&encode("1", Ok(page)))[1],
             "1\terror\tCursor too long\t"
         );
     }
 
     fn collection_page(uris: &[&str], next: &str) -> PageResponse {
-        PageResponse {
+        let page = PageResponse {
             items: uris
                 .iter()
                 .map(|uri| CollectionItem {
@@ -1216,29 +1293,25 @@ mod tests {
                 .collect(),
             next_page_token: next.into(),
             ..Default::default()
-        }
+        };
         // round trip through the wire format, as the server sends it
-        .write_to_bytes()
-        .map(|bytes| PageResponse::parse_from_bytes(&bytes).unwrap())
-        .unwrap()
+        PageResponse::parse_from_bytes(&page.write_to_bytes().unwrap()).unwrap()
     }
 
     fn walk_to_end(cursor: &str, prefix: &'static str, pages: &[PageResponse]) -> (Walk, String) {
         let mut walk = Walk::new(cursor, prefix).unwrap();
         let tokens = ["", "p2", "p3"];
-        let mut page = tokens.iter().position(|t| *t == walk.token).unwrap();
         loop {
+            let page = tokens.iter().position(|t| *t == walk.token).unwrap();
             if let Some(cursor) = walk.take(&pages[page]) {
                 return (walk, cursor);
             }
-            page = tokens.iter().position(|t| *t == walk.token).unwrap();
         }
     }
 
     #[test]
     fn liked_skips_albums_and_counts_across_pages() {
-        let album = "spotify:album:a";
-        let mut first: Vec<&str> = vec![album; 30];
+        let mut first = vec!["spotify:album:a"; 30];
         first.extend(["spotify:track:t"; 20]);
         let pages = [
             collection_page(&first, "p2"),
@@ -1247,32 +1320,31 @@ mod tests {
         ];
         let (walk, cursor) = walk_to_end("", "spotify:track:", &pages);
         assert_eq!(walk.found.len(), PAGE);
-        assert_eq!(walk.found[0].1, 0);
-        assert_eq!(walk.found[49].1, 49);
+        assert_eq!(walk.found[0].position, Some(0));
+        assert_eq!(walk.found[49].position, Some(49));
         // the page filled 30 rows into p2: the next starts there
         assert_eq!(cursor, "50.30.p2");
-        assert_eq!(walk.found[49].2, "50.30.p2");
-        assert_eq!(walk.found[19].2, "20.20.");
+        assert_eq!(walk.found[49].after, "50.30.p2");
+        assert_eq!(walk.found[19].after, "20.20.");
 
         let (walk, cursor) = walk_to_end(&cursor, "spotify:track:", &pages);
         assert_eq!(walk.found.len(), 30);
-        assert_eq!(walk.found[0].1, 50);
-        assert_eq!(walk.found[29].1, 79);
+        assert_eq!(walk.found[0].position, Some(50));
+        assert_eq!(walk.found[29].position, Some(79));
         assert_eq!(cursor, "");
     }
 
     #[test]
     fn albums_stop_at_the_first_liked_track() {
-        let mut first: Vec<&str> = vec!["spotify:album:a"; 3];
+        let mut first = vec!["spotify:album:a"; 3];
         first.push("spotify:track:t");
-        let pages = [collection_page(&first, "p2")];
-        let (walk, cursor) = walk_to_end("", "spotify:album:", &pages);
+        let (walk, cursor) = walk_to_end("", "spotify:album:", &[collection_page(&first, "p2")]);
         assert_eq!(walk.found.len(), 3);
         assert_eq!(cursor, "");
     }
 
     #[test]
-    fn walk_cursors_round_trip() {
+    fn cursors_round_trip() {
         let walk = Walk::new("12.3.tok.with.dots", "spotify:track:").unwrap();
         assert_eq!((walk.position, walk.skip), (12, 3));
         assert_eq!(walk.cursor(3), "12.3.tok.with.dots");
@@ -1281,6 +1353,18 @@ mod tests {
         assert_eq!(offset("").ok(), Some(0));
         assert_eq!(offset("51").ok(), Some(51));
         assert!(offset("-1").is_err());
+        // huge client numbers saturate instead of overflowing
+        let mut walk = Walk::new(&format!("{}.0.", usize::MAX), "spotify:track:").unwrap();
+        assert_eq!(
+            walk.take(&collection_page(&["spotify:track:t"], "")),
+            Some(String::new())
+        );
+        let page = search_rows(&serde_json::json!({}), "tracks", usize::MAX);
+        assert!(page.is_err());
+        assert_eq!(
+            window(&list(&["spotify:track:a"], 0, 1, false), usize::MAX).0,
+            1..1
+        );
     }
 
     fn list(uris: &[&str], pos: i32, length: i32, names: bool) -> SelectedListContent {
@@ -1303,8 +1387,7 @@ mod tests {
             }
         }
         list.contents = Some(contents).into();
-        let bytes = list.write_to_bytes().unwrap();
-        SelectedListContent::parse_from_bytes(&bytes).unwrap()
+        SelectedListContent::parse_from_bytes(&list.write_to_bytes().unwrap()).unwrap()
     }
 
     #[test]
@@ -1317,8 +1400,12 @@ mod tests {
             "spotify:track:c",
         ];
         // the server began at 50 as asked
-        let (entries, cursor) = playlist_tracks(&list(&uris, 50, 120, false), 50);
-        let positions: Vec<_> = entries.iter().map(|e| (e.0.as_str(), e.1)).collect();
+        let page = playlist_tracks(&list(&uris, 50, 120, false), 50, "spotify:playlist:p");
+        let positions: Vec<_> = page
+            .rows
+            .iter()
+            .map(|r| (r.uri.as_str(), r.position))
+            .collect();
         assert_eq!(
             positions,
             [
@@ -1328,12 +1415,13 @@ mod tests {
                 ("spotify:track:c", Some(54)),
             ]
         );
-        assert_eq!(entries[2].2, "53");
-        assert_eq!(cursor, "55");
+        assert_eq!(page.rows[2].after, "53");
+        assert_eq!(page.rows[2].context, "spotify:playlist:p");
+        assert_eq!(page.cursor, "55");
         // the server sent the whole list from 0
-        let (entries, cursor) = playlist_tracks(&list(&uris, 0, 5, false), 2);
-        assert_eq!(entries[0].1, Some(2));
-        assert_eq!(cursor, "");
+        let page = playlist_tracks(&list(&uris, 0, 5, false), 2, "");
+        assert_eq!(page.rows[0].position, Some(2));
+        assert_eq!(page.cursor, "");
     }
 
     #[test]
@@ -1351,6 +1439,52 @@ mod tests {
         assert_eq!(page.rows[1].subtitle, "bob");
         assert_eq!(page.rows[1].after, "4");
         assert_eq!(page.cursor, "");
+    }
+
+    #[test]
+    fn uris_are_checked() {
+        assert_eq!(
+            uri_of("spotify:playlist:37i9dQZF1DX", "playlist").ok(),
+            Some("37i9dQZF1DX")
+        );
+        assert!(uri_of("spotify:playlist:", "playlist").is_err());
+        assert!(uri_of("spotify:playlists:x", "playlist").is_err());
+        assert!(uri_of("spotify:playlist:a/../b", "playlist").is_err());
+        assert!(uri_of("spotify:album:x", "playlist").is_err());
+    }
+
+    #[test]
+    fn batched_metadata_leaves_out_broken_items() {
+        let gid = |b: u8| vec![b; 16];
+        let mut artist = metadata::Artist::new();
+        artist.set_gid(gid(3));
+        artist.set_name("The Fireflies".into());
+        let mut album = metadata::Album::new();
+        album.set_gid(gid(2));
+        let mut good = metadata::Track::new();
+        good.set_gid(gid(1));
+        good.set_name("Lantern Song".into());
+        good.album = Some(album).into();
+        good.artist.push(artist);
+        let uri = SpotifyUri::try_from(&good).unwrap().to_uri().unwrap();
+        let entry = |uri: &str, bytes: Vec<u8>| {
+            let mut data = EntityExtensionData::new();
+            data.entity_uri = uri.into();
+            data.extension_data.mut_or_insert_default().value = bytes;
+            data
+        };
+        let mut array = EntityExtensionDataArray::new();
+        array
+            .extension_data
+            .push(entry(&uri, good.write_to_bytes().unwrap()));
+        array
+            .extension_data
+            .push(entry("spotify:track:broken", vec![0xff, 0xff]));
+        let mut response = BatchedExtensionResponse::new();
+        response.extended_metadata.push(array);
+        let items = parse_items::<Track>(response);
+        assert_eq!(items.len(), 1);
+        assert_eq!(names(&items[&uri].artists), "The Fireflies");
     }
 
     #[test]
@@ -1379,6 +1513,7 @@ mod tests {
         assert_eq!(tracks.rows[0].subtitle, "The Fireflies, Moth");
         assert_eq!(tracks.rows[0].context, "");
         assert_eq!(tracks.rows[0].position, None);
+        assert_eq!(tracks.rows[0].after, "51");
         assert_eq!(tracks.cursor, "52");
         let albums = search_rows(&answer, "albums", 0).unwrap();
         assert_eq!((albums.rows[0].kind, albums.cursor.as_str()), ("album", ""));
@@ -1425,13 +1560,19 @@ mod tests {
     }
 
     #[test]
-    fn throttling_is_answered_locally() {
-        let fail = Fail::from(Error::from(HttpClientError::RetryAfter(
-            Duration::from_secs(90),
-        )));
+    fn throttling_holds_off_one_host_for_at_most_an_hour() {
+        let fail = failed(
+            HttpClientError::RetryAfter(Duration::from_secs(90)).into(),
+            PATHFINDER,
+        );
         assert_eq!(fail.0, Status::Throttled);
         assert!(fail.1.contains("90 s"));
-        let until = THROTTLED_UNTIL.lock().unwrap().take().unwrap();
-        assert!(until > Instant::now() + Duration::from_secs(80));
+        let huge = Duration::from_secs(u64::MAX / 4);
+        failed(HttpClientError::RetryAfter(huge).into(), SPCLIENT);
+        let [spclient, pathfinder] = *THROTTLED.lock().unwrap();
+        assert!(spclient.unwrap() <= Instant::now() + THROTTLE_MAX);
+        assert!(pathfinder.unwrap() > Instant::now() + Duration::from_secs(80));
+        forget_throttling();
+        assert_eq!(*THROTTLED.lock().unwrap(), [None, None]);
     }
 }

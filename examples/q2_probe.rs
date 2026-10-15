@@ -25,7 +25,7 @@ use librespot::{
 use protobuf::Message;
 
 const PAGE: i32 = 50;
-/// spotatui v0.45.0's searchDesktop hashes, newest first; a retired one gives 412.
+/// spotatui v0.45.0's searchDesktop hash; a retired one gives 412.
 const SEARCH_HASH: &str = "eef7cc54888d91bdd6802623477873caa3948ae173a0c34fd86827b267e94c03";
 
 fn report<T>(name: &str, result: Result<T, Error>, show: impl FnOnce(&T) -> String) -> Option<T> {

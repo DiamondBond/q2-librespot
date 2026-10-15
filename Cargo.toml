@@ -188,8 +188,6 @@ tokio = { version = "1", features = [
 ] }
 url = "2.2"
 
-[dev-dependencies]
-
 [package.metadata.deb]
 maintainer = "Librespot Organization <noreply@github.com>"
 copyright = "2015, Paul Liétar"
