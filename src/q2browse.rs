@@ -7,7 +7,7 @@ use librespot::{
     core::{Error, Session, SpotifyUri, error::ErrorKind, http_client::HttpClientError},
     metadata::{Album, Artist, Metadata, Track, artist::Artists},
     protocol::{
-        collection2v2::PageResponse,
+        collection2v2::{CollectionItem, PageResponse},
         extended_metadata::{
             BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
         },
@@ -44,8 +44,9 @@ const MAX_MESSAGE: usize = 120;
 const PAGE: usize = 50;
 /// Answer inside the client's 15 s.
 const DEADLINE: Duration = Duration::from_secs(14);
-/// Liked Songs and saved albums stop paging past other items here and leave a cursor.
+/// Reading saved albums or followed artists stops here, or at SAVED_MAX items.
 const PAGING_BUDGET: Duration = Duration::from_secs(10);
+const SAVED_MAX: usize = 1000;
 /// Throttled without a Retry-After: hold off this long.
 const THROTTLE_DEFAULT: Duration = Duration::from_secs(30);
 const THROTTLE_MAX: Duration = Duration::from_secs(3600);
@@ -461,9 +462,9 @@ async fn run(
         "account" => account(&session).await,
         "playlists" => playlists(&session, offset(last)?).await,
         "playlist" => playlist(&session, arg(0), offset(last)?).await,
-        "liked" => collection(&session, Walk::new(last, "spotify:track:")?).await,
-        "albums" => collection(&session, Walk::new(last, "spotify:album:")?).await,
-        "artists" => collection(&session, Walk::new(last, "spotify:artist:")?).await,
+        "liked" => liked(&session, offset(last)?).await,
+        "albums" => saved_albums(&session, offset(last)?).await,
+        "artists" => artists(&session, offset(last)?).await,
         "album" => album(&session, arg(0), offset(last)?).await,
         "artist" => artist(&session, arg(0)).await,
         "search" => search(&session, arg(0), arg(1), offset(last)?).await,
@@ -740,136 +741,102 @@ async fn playlist(session: &Session, uri: &str, from: usize) -> Result<Page, Fai
     })
 }
 
-/// A walk through a collection v2 set. Its cursor is `position.skip.token`: the next row's
-/// position, the matching items of the token's page already sent, and that page's token.
-#[derive(Debug, Default)]
-struct Walk {
-    prefix: &'static str,
-    position: usize,
-    skip: usize,
-    token: String,
-    /// Rows with their position and `after` set.
-    found: Vec<Row>,
+/// The rows of a list of `len` from `from`, and the cursor after them.
+fn page_of(len: usize, from: usize) -> (Range<usize>, String) {
+    let start = from.min(len);
+    let end = start.saturating_add(PAGE).min(len);
+    (start..end, cursor_at(end, end < len))
 }
 
-impl Walk {
-    fn new(cursor: &str, prefix: &'static str) -> Result<Walk, Fail> {
-        let mut walk = Walk {
-            prefix,
-            ..Default::default()
-        };
-        if !cursor.is_empty() {
-            let mut parts = cursor.splitn(3, '.');
-            let mut number = || parts.next().and_then(|n| n.parse().ok());
-            walk.position = number().ok_or_else(|| fail(Status::Bad))?;
-            walk.skip = number().ok_or_else(|| fail(Status::Bad))?;
-            walk.token = parts.next().ok_or_else(|| fail(Status::Bad))?.into();
-        }
-        Ok(walk)
-    }
-
-    fn cursor(&self, skip: usize) -> String {
-        format!("{}.{skip}.{}", self.position, self.token)
-    }
-
-    /// Takes the matching items of the page fetched with `self.token`. Returns the final
-    /// cursor once the walk ends, or `None` to fetch the next page.
-    fn take(&mut self, page: &PageResponse) -> Option<String> {
-        // the `collection` set lists saved albums first, then liked tracks
-        let albums_done = self.prefix == "spotify:album:";
-        let mut matched = 0;
-        for item in page.items.iter().filter(|i| !i.is_removed) {
-            if albums_done && item.uri.starts_with("spotify:track:") {
-                return Some(String::new());
-            }
-            if !item.uri.starts_with(self.prefix) {
-                continue;
-            }
-            matched += 1;
-            if matched <= self.skip {
-                continue;
-            }
-            if self.found.len() == PAGE {
-                return Some(self.cursor(matched - 1));
-            }
-            let position = self.position;
-            self.position = position.saturating_add(1);
-            self.found.push(Row {
-                uri: item.uri.clone(),
-                position: Some(position),
-                after: self.cursor(matched),
-                ..Default::default()
-            });
-        }
-        self.skip = 0;
-        self.token = page.next_page_token.clone();
-        if self.token.is_empty() {
-            Some(String::new())
-        } else if self.found.len() == PAGE {
-            Some(self.cursor(0))
-        } else {
-            None
-        }
-    }
+/// Liked Songs from Connect's own `collection` context: newest first, as the Spotify app
+/// lists them, and in the order Connect plays them, so positions are its indices.
+async fn liked(session: &Session, from: usize) -> Result<Page, Fail> {
+    let context = format!("spotify:user:{}:collection", session.username());
+    let ctx = session.spclient().get_context(&context).await?;
+    // ponytail: pages listed only by page_url are left out; the collection comes as one page
+    let uris: Vec<_> = ctx
+        .pages
+        .iter()
+        .flat_map(|p| &p.tracks)
+        .map(|t| t.uri())
+        .collect();
+    let (range, cursor) = page_of(uris.len(), from);
+    let rows = range
+        .filter(|&i| uris[i].starts_with("spotify:track:"))
+        .map(|i| row("track", uris[i].into(), &context, Some(i)));
+    Ok(Page {
+        rows: tracks(session, rows.collect()).await?,
+        cursor,
+        ..Default::default()
+    })
 }
 
-async fn collection(session: &Session, mut walk: Walk) -> Result<Page, Fail> {
-    let set = if walk.prefix == "spotify:artist:" {
-        "artist"
-    } else {
-        "collection"
-    };
+/// Adds a collection page's `prefix` items to `items`; true once the set has no more of them.
+fn take_saved(items: &mut Vec<CollectionItem>, page: PageResponse, prefix: &str) -> bool {
+    for item in page.items.into_iter().filter(|i| !i.is_removed) {
+        if item.uri.starts_with(prefix) {
+            items.push(item);
+        } else if item.uri.starts_with("spotify:track:") {
+            // the `collection` set lists saved albums first, then liked tracks
+            return true;
+        }
+    }
+    page.next_page_token.is_empty()
+}
+
+/// Saved albums (set `collection`) or followed artists (set `artist`), newest first.
+// ponytail: reads the set whole for every page, up to SAVED_MAX items or PAGING_BUDGET
+// (then the newest of what was read); a few hundred is the norm. Cache it if libraries grow.
+async fn saved(session: &Session, set: &str, prefix: &str) -> Result<Vec<String>, Fail> {
     let start = Instant::now();
-    let cursor = loop {
+    let mut items = Vec::new();
+    let mut token = String::new();
+    loop {
         let page = session
             .spclient()
-            .get_collection_page(set, &walk.token, PAGE as i32)
+            .get_collection_page(set, &token, PAGE as i32)
             .await?;
-        if let Some(cursor) = walk.take(&page) {
-            break cursor;
+        token = page.next_page_token.clone();
+        if take_saved(&mut items, page, prefix)
+            || items.len() >= SAVED_MAX
+            || start.elapsed() > PAGING_BUDGET
+        {
+            break;
         }
-        if start.elapsed() > PAGING_BUDGET {
-            break walk.cursor(0);
-        }
-    };
-    let rows = match walk.prefix {
-        "spotify:track:" => {
-            let context = format!("spotify:user:{}:collection", session.username());
-            let found = walk.found.into_iter();
-            let rows = found.map(|r| Row {
-                kind: "track",
-                context: context.clone(),
-                ..r
-            });
-            tracks(session, rows.collect()).await?
-        }
-        "spotify:album:" => {
-            let found = walk.found.into_iter();
-            let rows = found.map(|r| Row {
-                kind: "album",
-                position: None,
-                ..r
-            });
-            albums(session, rows.collect()).await?
-        }
-        _ => {
-            let found = walk.found.into_iter();
-            let rows = found.map(|r| Row {
-                kind: "artist",
-                position: None,
-                ..r
-            });
-            fill(
-                session,
-                ExtensionKind::ARTIST_V4,
-                rows.collect(),
-                |a: &Artist| (a.name.clone(), String::new()),
-            )
-            .await?
-        }
-    };
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.added_at));
+    Ok(items.into_iter().map(|item| item.uri).collect())
+}
+
+async fn saved_albums(session: &Session, from: usize) -> Result<Page, Fail> {
+    let uris = saved(session, "collection", "spotify:album:").await?;
+    let (range, cursor) = page_of(uris.len(), from);
+    let rows = range.map(|i| Row {
+        position: None,
+        ..row("album", uris[i].clone(), "", Some(i))
+    });
     Ok(Page {
-        rows,
+        rows: albums(session, rows.collect()).await?,
+        cursor,
+        ..Default::default()
+    })
+}
+
+async fn artists(session: &Session, from: usize) -> Result<Page, Fail> {
+    let uris = saved(session, "artist", "spotify:artist:").await?;
+    let (range, cursor) = page_of(uris.len(), from);
+    let rows = range.map(|i| Row {
+        position: None,
+        ..row("artist", uris[i].clone(), "", Some(i))
+    });
+    let rows = fill(
+        session,
+        ExtensionKind::ARTIST_V4,
+        rows.collect(),
+        |a: &Artist| (a.name.clone(), String::new()),
+    );
+    Ok(Page {
+        rows: rows.await?,
         cursor,
         ..Default::default()
     })
@@ -1298,67 +1265,40 @@ mod tests {
         PageResponse::parse_from_bytes(&page.write_to_bytes().unwrap()).unwrap()
     }
 
-    fn walk_to_end(cursor: &str, prefix: &'static str, pages: &[PageResponse]) -> (Walk, String) {
-        let mut walk = Walk::new(cursor, prefix).unwrap();
-        let tokens = ["", "p2", "p3"];
-        loop {
-            let page = tokens.iter().position(|t| *t == walk.token).unwrap();
-            if let Some(cursor) = walk.take(&pages[page]) {
-                return (walk, cursor);
-            }
-        }
-    }
-
     #[test]
-    fn liked_skips_albums_and_counts_across_pages() {
-        let mut first = vec!["spotify:album:a"; 30];
-        first.extend(["spotify:track:t"; 20]);
-        let pages = [
+    fn saved_sets_stop_at_liked_tracks() {
+        let mut items = Vec::new();
+        let mut first = vec!["spotify:album:a"; 50];
+        first[3] = "spotify:show:s";
+        assert!(!take_saved(
+            &mut items,
             collection_page(&first, "p2"),
-            collection_page(&["spotify:track:t"; 50], "p3"),
-            collection_page(&["spotify:track:t"; 10], ""),
-        ];
-        let (walk, cursor) = walk_to_end("", "spotify:track:", &pages);
-        assert_eq!(walk.found.len(), PAGE);
-        assert_eq!(walk.found[0].position, Some(0));
-        assert_eq!(walk.found[49].position, Some(49));
-        // the page filled 30 rows into p2: the next starts there
-        assert_eq!(cursor, "50.30.p2");
-        assert_eq!(walk.found[49].after, "50.30.p2");
-        assert_eq!(walk.found[19].after, "20.20.");
-
-        let (walk, cursor) = walk_to_end(&cursor, "spotify:track:", &pages);
-        assert_eq!(walk.found.len(), 30);
-        assert_eq!(walk.found[0].position, Some(50));
-        assert_eq!(walk.found[29].position, Some(79));
-        assert_eq!(cursor, "");
+            "spotify:album:"
+        ));
+        let second = ["spotify:album:b", "spotify:track:t", "spotify:album:c"];
+        assert!(take_saved(
+            &mut items,
+            collection_page(&second, "p3"),
+            "spotify:album:"
+        ));
+        assert_eq!(items.len(), 50);
+        // followed artists end with the set
+        let mut artists = Vec::new();
+        let page = collection_page(&["spotify:artist:r"; 3], "");
+        assert!(take_saved(&mut artists, page, "spotify:artist:"));
+        assert_eq!(artists.len(), 3);
     }
 
     #[test]
-    fn albums_stop_at_the_first_liked_track() {
-        let mut first = vec!["spotify:album:a"; 3];
-        first.push("spotify:track:t");
-        let (walk, cursor) = walk_to_end("", "spotify:album:", &[collection_page(&first, "p2")]);
-        assert_eq!(walk.found.len(), 3);
-        assert_eq!(cursor, "");
-    }
-
-    #[test]
-    fn cursors_round_trip() {
-        let walk = Walk::new("12.3.tok.with.dots", "spotify:track:").unwrap();
-        assert_eq!((walk.position, walk.skip), (12, 3));
-        assert_eq!(walk.cursor(3), "12.3.tok.with.dots");
-        assert!(Walk::new("12", "spotify:track:").is_err());
-        assert!(Walk::new("a.b.c", "spotify:track:").is_err());
+    fn offset_pages_and_cursors() {
+        assert_eq!(page_of(120, 0), (0..50, "50".into()));
+        assert_eq!(page_of(120, 100), (100..120, String::new()));
+        assert_eq!(page_of(120, usize::MAX), (120..120, String::new()));
         assert_eq!(offset("").ok(), Some(0));
         assert_eq!(offset("51").ok(), Some(51));
         assert!(offset("-1").is_err());
+        assert!(offset("50.1.tok").is_err());
         // huge client numbers saturate instead of overflowing
-        let mut walk = Walk::new(&format!("{}.0.", usize::MAX), "spotify:track:").unwrap();
-        assert_eq!(
-            walk.take(&collection_page(&["spotify:track:t"], "")),
-            Some(String::new())
-        );
         let page = search_rows(&serde_json::json!({}), "tracks", usize::MAX);
         assert!(page.is_err());
         assert_eq!(
