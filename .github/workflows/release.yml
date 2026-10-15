@@ -7,6 +7,7 @@ on:
 
 jobs:
   publish-crates:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     name: Publish librespot
     runs-on: ubuntu-latest
     permissions: 
