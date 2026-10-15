@@ -35,10 +35,14 @@ use std::{
 };
 use sysinfo::{ProcessesToUpdate, System};
 use thiserror::Error;
-use tokio::{net::UnixDatagram, sync::Semaphore};
+use tokio::{
+    net::UnixDatagram,
+    sync::{Semaphore, mpsc, watch},
+};
 use url::Url;
 
 mod player_event_handler;
+mod q2browse;
 mod status_file;
 use player_event_handler::{EventHandler, run_program_on_sink_events};
 
@@ -222,6 +226,7 @@ struct Setup {
     emit_sink_events: bool,
     control_socket: Option<PathBuf>,
     status_file: Option<PathBuf>,
+    browse_socket: Option<PathBuf>,
     zeroconf_ip: Vec<std::net::IpAddr>,
     zeroconf_backend: Option<DnsSdServiceBuilder>,
 }
@@ -242,6 +247,7 @@ async fn get_setup() -> Setup {
     const BITRATE: &str = "bitrate";
     const CACHE: &str = "cache";
     const CACHE_SIZE_LIMIT: &str = "cache-size-limit";
+    const BROWSE_SOCKET: &str = "browse-socket";
     const CONTROL_SOCKET: &str = "control-socket";
     const DEVICE: &str = "device";
     const DEVICE_TYPE: &str = "device-type";
@@ -342,6 +348,7 @@ async fn get_setup() -> Setup {
     const ZEROCONF_PORT_SHORT: &str = "z";
     const ZEROCONF_BACKEND_SHORT: &str = ""; // no short flag
     const LOCAL_FILE_DIR_SHORT: &str = "l";
+    const BROWSE_SOCKET_SHORT: &str = ""; // no short flag
     const CONTROL_SOCKET_SHORT: &str = ""; // no short flag
     const STATUS_FILE_SHORT: &str = ""; // no short flag
 
@@ -683,6 +690,11 @@ async fn get_setup() -> Setup {
         STATUS_FILE_SHORT,
         STATUS_FILE,
         "File to keep the player's state, track and position in, with the track's cover in PATH.jpg.",
+        "PATH"
+    ).optopt(
+        BROWSE_SOCKET_SHORT,
+        BROWSE_SOCKET,
+        "Unix stream socket to bind for Q2 Pod's Spotify browser (the Q2SPOT/1 protocol).",
         "PATH"
     );
 
@@ -1857,6 +1869,7 @@ async fn get_setup() -> Setup {
     let emit_sink_events = opt_present(EMIT_SINK_EVENTS);
     let control_socket = opt_str(CONTROL_SOCKET).map(PathBuf::from);
     let status_file = opt_str(STATUS_FILE).map(PathBuf::from);
+    let browse_socket = opt_str(BROWSE_SOCKET).map(PathBuf::from);
 
     Setup {
         format,
@@ -1876,8 +1889,29 @@ async fn get_setup() -> Setup {
         emit_sink_events,
         control_socket,
         status_file,
+        browse_socket,
         zeroconf_ip,
         zeroconf_backend,
+    }
+}
+
+/// Stops Connect and its session, as for a new login.
+fn stop<F: Future<Output = ()> + Send + 'static>(
+    spirc: &mut Option<Spirc>,
+    spirc_task: &mut Option<Pin<Box<F>>>,
+    session: &Session,
+) {
+    if let Some(spirc) = spirc.take() {
+        if let Err(e) = spirc.shutdown() {
+            error!("error sending spirc shutdown message: {e}");
+        }
+    }
+    if let Some(spirc_task) = spirc_task.take() {
+        // Continue shutdown in its own task
+        tokio::spawn(spirc_task);
+    }
+    if !session.is_invalid() {
+        session.shutdown();
     }
 }
 
@@ -2042,6 +2076,15 @@ async fn main() {
     });
     let mut command = [0u8; 16];
 
+    let (link, browse_link) = watch::channel(match last_credentials {
+        Some(_) => q2browse::Link::Connecting,
+        None => q2browse::Link::Login,
+    });
+    let (signout, mut signout_requests) = mpsc::unbounded_channel();
+    if let Some(path) = setup.browse_socket.as_ref() {
+        q2browse::serve(path, browse_link, signout.clone());
+    }
+
     loop {
         tokio::select! {
             Ok(n) = async { control.as_ref().unwrap().recv(&mut command).await }, if control.is_some() => {
@@ -2071,27 +2114,26 @@ async fn main() {
                     Some(credentials) => {
                         last_credentials = Some(credentials.clone());
                         auto_connect_times.clear();
-
-                        if let Some(spirc) = spirc.take() {
-                            if let Err(e) = spirc.shutdown() {
-                                error!("error sending spirc shutdown message: {e}");
-                            }
-                        }
-                        if let Some(spirc_task) = spirc_task.take() {
-                            // Continue shutdown in its own task
-                            tokio::spawn(spirc_task);
-                        }
-                        if !session.is_invalid() {
-                            session.shutdown();
-                        }
-
+                        stop(&mut spirc, &mut spirc_task, &session);
                         connecting = true;
+                        link.send_replace(q2browse::Link::Connecting);
                     },
                     None => {
                         error!("Discovery stopped unexpectedly");
                         exit(1);
                     }
                 }
+            },
+            Some(done) = signout_requests.recv() => {
+                info!("Signing out");
+                stop(&mut spirc, &mut spirc_task, &session);
+                if let Some(Err(e)) = setup.cache.as_ref().map(Cache::remove_credentials) {
+                    error!("Could not remove the saved login: {e}");
+                }
+                last_credentials = None;
+                connecting = false;
+                link.send_replace(q2browse::Link::Login);
+                let _ = done.send(());
             },
             _ = async {}, if connecting && last_credentials.is_some() => {
                 if session.is_invalid() {
@@ -2112,6 +2154,7 @@ async fn main() {
                         exit(1);
                     }
                 };
+                link.send_replace(q2browse::Link::Ready(session.clone(), spirc_.clone()));
                 spirc = Some(spirc_);
                 spirc_task = Some(Box::pin(spirc_task_));
 
@@ -2137,6 +2180,7 @@ async fn main() {
                         session.shutdown();
                     }
                     connecting = true;
+                    link.send_replace(q2browse::Link::Connecting);
                 } else {
                     error!("Spirc shut down too often. Not reconnecting automatically.");
                     exit(1);

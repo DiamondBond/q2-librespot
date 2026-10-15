@@ -12,7 +12,8 @@ while :; do
     ./librespot -n Q2 -b 160 --cache ./cache --disable-audio-cache \
         --backend subprocess --device "/bin/sh ./aplay.sh" \
         --volume-ctrl fixed --initial-volume 100 \
-        --control-socket /tmp/q2-librespot.sock --status-file /tmp/q2-librespot.state 2>> ./spot.log
+        --control-socket /tmp/q2-librespot.sock --status-file /tmp/q2-librespot.state \
+        --browse-socket /tmp/q2-librespot.browse.sock 2>> ./spot.log
     echo "exit $? $(date)" >> ./spot.log
     if [ $(($(date +%s) - start)) -gt 60 ]; then wait=5; elif [ $wait -lt 60 ]; then wait=$((wait * 2)); fi
     sleep $wait

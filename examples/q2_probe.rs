@@ -146,17 +146,52 @@ async fn main() {
         .get_rootlist(0, Some(PAGE as usize))
         .await
         .and_then(|bytes| Ok(SelectedListContent::parse_from_bytes(&bytes)?));
-    report("playlists", rootlist, |list| {
-        let items = &list.contents.items;
-        let first = items
+    let rootlist = report("playlists", rootlist, |list| {
+        let contents = &list.contents;
+        let first = contents
+            .items
             .iter()
-            .find(|i| i.uri().starts_with("spotify:playlist:"));
+            .position(|i| i.uri().starts_with("spotify:playlist:"));
+        let meta = first.and_then(|i| contents.meta_items.get(i));
         format!(
-            "{} rows (first {})",
-            items.len(),
-            first.map_or("none", |i| i.uri())
+            "{} rows, {} meta (first {} \"{}\" by {})",
+            contents.items.len(),
+            contents.meta_items.len(),
+            first.map_or("none", |i| contents.items[i].uri()),
+            meta.map_or("", |m| m.attributes.name()),
+            meta.map_or("", |m| m.owner_username()),
         )
     });
+    // q2browse pages a playlist with from/length; pos shows whether the server began there
+    let first_playlist = rootlist.as_ref().and_then(|list| {
+        list.contents
+            .items
+            .iter()
+            .map(|i| i.uri())
+            .find(|uri| uri.starts_with("spotify:playlist:"))
+            .map(str::to_owned)
+    });
+    if let Some(uri) = first_playlist {
+        let id = uri.rsplit(':').next().unwrap_or_default();
+        let page = session
+            .spclient()
+            .request(
+                &http::Method::GET,
+                &format!("/playlist/v2/playlist/{id}?from={PAGE}&length={PAGE}"),
+                None,
+                None,
+            )
+            .await
+            .and_then(|bytes| Ok(SelectedListContent::parse_from_bytes(&bytes)?));
+        report("playlist page two", page, |list| {
+            format!(
+                "{uri}: pos {}, {} rows of {}",
+                list.contents.pos(),
+                list.contents.items.len(),
+                list.length()
+            )
+        });
+    }
 
     let saved = report(
         "collection",

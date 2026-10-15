@@ -173,6 +173,8 @@ getopts = "0.2"
 http = "1"
 libc = "0.2"
 log = "0.4"
+protobuf = "3.7"
+serde_json = "1.0"
 sha1 = "0.10"
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 thiserror = "2"
@@ -187,8 +189,6 @@ tokio = { version = "1", features = [
 url = "2.2"
 
 [dev-dependencies]
-protobuf = "3.7"
-serde_json = "1.0"
 
 [package.metadata.deb]
 maintainer = "Librespot Organization <noreply@github.com>"
