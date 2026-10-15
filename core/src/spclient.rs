@@ -16,6 +16,7 @@ use crate::{
             ChallengeAnswer, ChallengeType, ClientTokenRequest, ClientTokenRequestType,
             ClientTokenResponse, ClientTokenResponseType,
         },
+        collection2v2::{PageRequest, PageResponse},
         connect::PutStateRequest,
         context::Context,
         extended_metadata::BatchedEntityRequest,
@@ -61,6 +62,10 @@ const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
     salt: false,
     base_url: None,
 };
+
+const COLLECTION_CONTENT_TYPE: &str = "application/vnd.collection-v2.spotify.proto";
+const PATHFINDER_BASE_URL: &str = "https://api-partner.spotify.com";
+const PATHFINDER_APP_PLATFORM: &str = "Win32_x86_64";
 
 #[derive(Debug, Error)]
 pub enum SpClientError {
@@ -956,5 +961,82 @@ impl SpClient {
             &NO_METRICS_AND_SALT,
         )
         .await
+    }
+
+    /// One page of a collection set: `collection` (liked tracks and saved albums),
+    /// `artist`, `show`, `listenlater`, `ylpin`. An empty token asks for the first page.
+    pub async fn get_collection_page(
+        &self,
+        set: &str,
+        pagination_token: &str,
+        limit: i32,
+    ) -> Result<PageResponse, Error> {
+        let request = PageRequest {
+            username: self.session().username(),
+            set: set.to_owned(),
+            pagination_token: pagination_token.to_owned(),
+            limit,
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(COLLECTION_CONTENT_TYPE),
+        );
+        headers.insert(ACCEPT, HeaderValue::from_static(COLLECTION_CONTENT_TYPE));
+        let body = request.write_to_bytes()?;
+        let bytes = self
+            .request_with_options(
+                &Method::POST,
+                "/collection/v2/paging",
+                Some(headers),
+                Some(&body),
+                &NO_METRICS_AND_SALT,
+            )
+            .await?;
+        Ok(PageResponse::parse_from_bytes(&bytes)?)
+    }
+
+    /// Runs a persisted Pathfinder (GraphQL) query. A stale `sha256_hash` gives
+    /// HTTP 412 (`ErrorKind::FailedPrecondition`).
+    pub async fn pathfinder_query(
+        &self,
+        operation_name: &str,
+        sha256_hash: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let body = serde_json::json!({
+            "variables": variables,
+            "operationName": operation_name,
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": sha256_hash}},
+        })
+        .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json;charset=UTF-8"),
+        );
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "app-platform",
+            HeaderValue::from_static(PATHFINDER_APP_PLATFORM),
+        );
+        headers.insert(
+            "spotify-app-version",
+            HeaderValue::from_str(&spotify_semantic_version())?,
+        );
+        let bytes = self
+            .request_with_options(
+                &Method::POST,
+                "/pathfinder/v2/query",
+                Some(headers),
+                Some(body.as_bytes()),
+                &RequestOptions {
+                    base_url: Some(PATHFINDER_BASE_URL),
+                    ..NO_METRICS_AND_SALT
+                },
+            )
+            .await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 }

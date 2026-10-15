@@ -1815,6 +1815,8 @@ dependencies = [
  "librespot-playback",
  "librespot-protocol",
  "log",
+ "protobuf",
+ "serde_json",
  "sha1",
  "sysinfo",
  "thiserror 2.0.17",
