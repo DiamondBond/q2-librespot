@@ -81,6 +81,9 @@ struct SpircTask {
     connect_established: bool,
 
     play_request_id: Option<u64>,
+    /// Its own load is on its way, so the next play request id is its own; any other load (the
+    /// Q2 browser's Downloaded Tracks) is not, and that track's events are left to its owner.
+    loading: bool,
     play_status: SpircPlayStatus,
 
     connection_id_update: BoxedStreamResult<String>,
@@ -256,6 +259,7 @@ impl Spirc {
             connect_established: false,
 
             play_request_id: None,
+            loading: false,
             play_status: SpircPlayStatus::Stopped,
 
             connection_id_update,
@@ -783,7 +787,7 @@ impl SpircTask {
 
         // update play_request_id
         if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
-            self.play_request_id = Some(play_request_id);
+            self.play_request_id = std::mem::take(&mut self.loading).then_some(play_request_id);
             return Ok(());
         }
 
@@ -1915,6 +1919,7 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
+        self.loading = true;
         self.player.load(id, start_playing, position_ms);
 
         self.connect_state

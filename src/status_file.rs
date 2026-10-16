@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http::Request;
 use librespot::{
-    core::http_client::HttpClient,
+    core::{cache::Cache, http_client::HttpClient},
     metadata::audio::UniqueFields,
     playback::player::{PlayerEvent, PlayerEventChannel},
 };
@@ -27,6 +27,7 @@ struct Status {
     position_ms: u32,
     at_ms: u64,
     cover: bool,
+    serial: u64,
 }
 
 impl Status {
@@ -100,7 +101,12 @@ async fn fetch_cover(client: &HttpClient, url: &str) -> Option<Bytes> {
 /// session (`state=none` without one), playing, paused or stopped, the track's metadata and its
 /// position at `at` (CLOCK_MONOTONIC ms). Each track's cover is fetched to `path.jpg`, and
 /// `cover=1` once that file holds the current track's.
-pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
+pub fn run(
+    mut events: PlayerEventChannel,
+    path: PathBuf,
+    proxy: Option<Url>,
+    cache: Option<Cache>,
+) {
     let status = Arc::new(Mutex::new(Status::new("none")));
     write_status(&path, &status.lock().unwrap());
     let client = Arc::new(HttpClient::new(proxy.as_ref()));
@@ -109,9 +115,22 @@ pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
         while let Some(event) = events.recv().await {
             let mut s = status.lock().unwrap();
             match event {
-                PlayerEvent::SessionConnected { .. } => *s = Status::new("stopped"),
-                PlayerEvent::SessionDisconnected { .. } => *s = Status::new("none"),
+                PlayerEvent::SessionConnected { .. } => {
+                    let serial = s.serial.wrapping_add(1);
+                    *s = Status {
+                        serial,
+                        ..Status::new("stopped")
+                    };
+                }
+                PlayerEvent::SessionDisconnected { .. } => {
+                    let serial = s.serial.wrapping_add(1);
+                    *s = Status {
+                        serial,
+                        ..Status::new("none")
+                    };
+                }
                 PlayerEvent::TrackChanged { audio_item } => {
+                    s.serial = s.serial.wrapping_add(1);
                     s.track = audio_item.track_id.to_id().unwrap_or_default();
                     s.title = one_line(&audio_item.name);
                     s.duration_ms = audio_item.duration_ms;
@@ -133,6 +152,13 @@ pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
                     s.artist = one_line(&s.artist);
                     s.album = one_line(&s.album);
                     s.cover = false;
+                    if let Some(jpeg) = cache
+                        .as_ref()
+                        .and_then(|cache| cache.offline_cover(&s.track))
+                    {
+                        write_atomic(&cover_path(&path), &jpeg);
+                        s.cover = true;
+                    }
 
                     let mut covers = audio_item.covers;
                     covers.sort_by_key(|c| c.width);
@@ -142,15 +168,21 @@ pub fn run(mut events: PlayerEventChannel, path: PathBuf, proxy: Option<Url>) {
                         .or(covers.last())
                         .map(|c| c.url.clone());
                     if let Some(url) = cover {
-                        let (status, client, path) = (status.clone(), client.clone(), path.clone());
-                        let track = s.track.clone();
+                        let (status, client, path, cache) =
+                            (status.clone(), client.clone(), path.clone(), cache.clone());
+                        let serial = s.serial;
                         tokio::spawn(async move {
                             let Some(jpeg) = fetch_cover(&client, &url).await else {
                                 return;
                             };
                             let mut s = status.lock().unwrap();
-                            if s.track == track {
+                            if s.serial == serial {
                                 write_atomic(&cover_path(&path), &jpeg);
+                                if let Some(cache) = cache {
+                                    if let Err(e) = cache.save_offline_cover(&s.track, &jpeg) {
+                                        warn!("Could not cache cover: {e}");
+                                    }
+                                }
                                 s.cover = true;
                                 write_status(&path, &s);
                             }

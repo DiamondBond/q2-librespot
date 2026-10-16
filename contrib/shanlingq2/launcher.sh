@@ -9,7 +9,7 @@ cd /mnt/mmc/.spotify || exit 1
 wait=5
 while :; do
     start=$(date +%s)
-    ./librespot -n Q2 -b 160 --cache ./cache --disable-audio-cache \
+    ./librespot -n Q2 -b 160 --cache ./cache --cache-size-limit 2G \
         --backend subprocess --device "/bin/sh ./aplay.sh" \
         --volume-ctrl fixed --initial-volume 100 \
         --control-socket /tmp/q2-librespot.sock --status-file /tmp/q2-librespot.state \

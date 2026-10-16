@@ -1929,6 +1929,7 @@ async fn main() {
     let mut spirc: Option<Spirc> = None;
     let mut spirc_task: Option<Pin<_>> = None;
     let mut auto_connect_times: Vec<Instant> = vec![];
+    let mut next_connect = Instant::now();
     let mut discovery = None;
     let mut connecting = false;
     let mut _event_handler: Option<EventHandler> = None;
@@ -1978,6 +1979,9 @@ async fn main() {
     }
 
     if let Some(credentials) = setup.credentials {
+        if let Some(username) = credentials.username.as_deref() {
+            session.set_username(username);
+        }
         last_credentials = Some(credentials);
         connecting = true;
     } else if setup.enable_oauth {
@@ -2026,6 +2030,7 @@ async fn main() {
     let player = Player::new(player_config, session.clone(), soft_volume, move || {
         (backend)(device, format)
     });
+    let offline = q2browse::OfflinePlayback::new(setup.cache.clone(), player.clone());
 
     if let Some(player_event_program) = setup.player_event_program.clone() {
         _event_handler = Some(EventHandler::new(
@@ -2045,6 +2050,7 @@ async fn main() {
             player.get_player_event_channel(),
             path,
             setup.session_config.proxy.clone(),
+            setup.cache.clone(),
         );
     }
 
@@ -2062,13 +2068,13 @@ async fn main() {
     });
     let (signout, mut signout_requests) = mpsc::unbounded_channel();
     if let Some(path) = setup.browse_socket.as_ref() {
-        q2browse::serve(path, browse_link, signout.clone());
+        q2browse::serve(path, browse_link, signout.clone(), offline.clone());
     }
 
     loop {
         tokio::select! {
             Ok(n) = async { control.as_ref().unwrap().recv(&mut command).await }, if control.is_some() => {
-                if let Some(spirc) = spirc.as_ref() {
+                if !offline.control(&command[..n]) { if let Some(spirc) = spirc.as_ref() {
                     let result = match &command[..n] {
                         b"p" => spirc.play_pause(),
                         b"P" => spirc.play(),
@@ -2082,7 +2088,7 @@ async fn main() {
                     if let Err(e) = result {
                         warn!("Control command failed: {e}");
                     }
-                }
+                }}
             },
             credentials = async {
                 match discovery.as_mut() {
@@ -2109,12 +2115,13 @@ async fn main() {
                         }
 
                         connecting = true;
+                        next_connect = Instant::now(); // a new pairing waits out no earlier retry
                         q2browse::forget_throttling();
                         link.send_replace(q2browse::Link::Connecting);
                     },
                     None => {
-                        error!("Discovery stopped unexpectedly");
-                        exit(1);
+                        warn!("Discovery stopped; cached tracks remain available");
+                        discovery = None;
                     }
                 }
             },
@@ -2124,15 +2131,27 @@ async fn main() {
                 if let Some(Err(e)) = setup.cache.as_ref().map(Cache::remove_credentials) {
                     error!("Could not remove the saved login: {e}");
                 }
+                offline.end();
+                player.stop();
+                if let Some(Err(e)) = setup.cache.as_ref().map(Cache::clear_offline) {
+                    error!("Could not remove offline audio and keys: {e}");
+                }
                 let _ = done.send(());
                 // A fresh process forgets the login everywhere, discovery's included: once the
                 // reply is out, shut down as on Ctrl-C (playback stops) and the launcher restarts us.
                 let _ = tokio::time::timeout(Duration::from_secs(5), flushed).await;
+                // A download or cover that finished meanwhile is removed too.
+                if let Some(Err(e)) = setup.cache.as_ref().map(Cache::clear_offline) {
+                    error!("Could not remove offline audio and keys: {e}");
+                }
                 break;
             },
-            _ = async {}, if connecting && last_credentials.is_some() => {
+            _ = tokio::time::sleep_until(next_connect.into()), if connecting && last_credentials.is_some() => {
                 if session.is_invalid() {
                     session = Session::new(setup.session_config.clone(), setup.cache.clone());
+                    if let Some(username) = last_credentials.as_ref().and_then(|c| c.username.as_deref()) {
+                        session.set_username(username);
+                    }
                     player.set_session(session.clone());
                 }
 
@@ -2145,8 +2164,9 @@ async fn main() {
                                                                 mixer.clone()).await {
                     Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
                     Err(e) => {
-                        error!("could not initialize spirc: {e}");
-                        exit(1);
+                        warn!("Could not connect to Spotify, retrying: {e}");
+                        next_connect = Instant::now() + Duration::from_secs(10);
+                        continue;
                     }
                 };
                 link.send_replace(q2browse::Link::Ready(session.clone(), spirc_.clone()));
@@ -2175,10 +2195,13 @@ async fn main() {
                         session.shutdown();
                     }
                     connecting = true;
+                    next_connect = Instant::now();
                     link.send_replace(q2browse::Link::Connecting);
                 } else {
-                    error!("Spirc shut down too often. Not reconnecting automatically.");
-                    exit(1);
+                    warn!("Spirc shut down too often; retrying in 30 s.");
+                    connecting = last_credentials.is_some();
+                    next_connect = Instant::now() + Duration::from_secs(30);
+                    link.send_replace(q2browse::Link::Connecting);
                 }
             },
             _ = async {}, if player.is_invalid() => {

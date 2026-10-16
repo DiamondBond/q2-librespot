@@ -9,9 +9,25 @@ use std::{
 };
 
 use priority_queue::PriorityQueue;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{Error, FileId, authentication::Credentials, error::ErrorKind};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OfflineTrack {
+    pub account: String,
+    pub uri: String,
+    pub file: [u8; 20],
+    pub format: i32,
+    pub key: Option<[u8; 16]>,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_ms: u32,
+    pub is_explicit: bool,
+    pub played_at: u64,
+}
 
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
 
@@ -162,6 +178,10 @@ impl FsSizeLimiter {
                 }
                 Ok(file_type) if file_type.is_file() => {
                     let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "tmp") {
+                        let _ = fs::remove_file(path);
+                        continue;
+                    }
                     match Self::get_metadata(&path) {
                         Ok((access_time, size)) => {
                             limiter.add(&path, size, access_time);
@@ -263,6 +283,7 @@ pub struct Cache {
     credentials_location: Option<PathBuf>,
     volume_location: Option<PathBuf>,
     audio_location: Option<PathBuf>,
+    offline_location: Option<PathBuf>,
     size_limiter: Option<Arc<FsSizeLimiter>>,
 }
 
@@ -304,6 +325,9 @@ impl Cache {
             credentials_location,
             volume_location,
             audio_location,
+            offline_location: credentials_path
+                .as_ref()
+                .map(|p| p.as_ref().join("offline")),
             size_limiter,
         };
 
@@ -422,19 +446,124 @@ impl Cache {
     pub fn save_file<F: Read>(&self, file: FileId, contents: &mut F) -> Result<PathBuf, Error> {
         if let Some(path) = self.file_path(file) {
             if let Some(parent) = path.parent() {
-                if let Ok(size) = fs::create_dir_all(parent)
-                    .and_then(|_| File::create(&path))
-                    .and_then(|mut file| io::copy(contents, &mut file))
-                {
+                let tmp = path.with_extension("tmp");
+                let result = fs::create_dir_all(parent)
+                    .and_then(|_| File::create(&tmp))
+                    .and_then(|mut out| {
+                        let size = io::copy(contents, &mut out)?;
+                        out.sync_all()?;
+                        fs::rename(&tmp, &path)?;
+                        Ok(size)
+                    });
+                if let Ok(size) = result {
                     if let Some(limiter) = self.size_limiter.as_deref() {
                         limiter.add(&path, size);
                         limiter.prune()?;
                     }
                     return Ok(path);
                 }
+                let _ = fs::remove_file(tmp);
             }
         }
         Err(CacheError::Path.into())
+    }
+
+    pub fn save_offline_track(&self, track: &OfflineTrack) -> Result<(), Error> {
+        let dir = self.offline_location.as_ref().ok_or(CacheError::Path)?;
+        fs::create_dir_all(dir)?;
+        let name = FileId(track.file).to_base16()?;
+        let path = dir.join(name);
+        let tmp = path.with_extension("tmp");
+        let data = serde_json::to_vec(track)?;
+        File::create(&tmp)?.write_all(&data)?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    pub fn offline_tracks(&self, account: &str) -> Vec<OfflineTrack> {
+        let Some(dir) = &self.offline_location else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut tracks = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(data) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(track) = serde_json::from_slice::<OfflineTrack>(&data) else {
+                continue;
+            };
+            if track.account != account || track.account.is_empty() {
+                continue;
+            }
+            let Some(path) = self.file_path(FileId(track.file)) else {
+                continue;
+            };
+            if path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
+                tracks.push(track);
+            } else if now.saturating_sub(track.played_at) > 86_400 {
+                // Evicted audio: its record and art go too, so they stay within the audio's count.
+                // A day's grace, so a download still running keeps the key it will need.
+                let _ = fs::remove_file(entry.path());
+                if let Some(art) = track
+                    .uri
+                    .rsplit(':')
+                    .next()
+                    .and_then(|id| self.offline_cover_path(id))
+                {
+                    let _ = fs::remove_file(art);
+                }
+            }
+        }
+        tracks.sort_by(|a, b| b.played_at.cmp(&a.played_at));
+        tracks
+    }
+
+    fn offline_cover_path(&self, id: &str) -> Option<PathBuf> {
+        if id.len() != 22 || !id.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(
+            self.offline_location
+                .as_ref()?
+                .join("art")
+                .join(format!("{id}.jpg")),
+        )
+    }
+
+    pub fn offline_cover(&self, id: &str) -> Option<Vec<u8>> {
+        fs::read(self.offline_cover_path(id)?).ok()
+    }
+
+    pub fn save_offline_cover(&self, id: &str, jpeg: &[u8]) -> Result<(), Error> {
+        let path = self.offline_cover_path(id).ok_or(CacheError::Path)?;
+        fs::create_dir_all(path.parent().ok_or(CacheError::Path)?)?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, jpeg)?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    pub fn clear_offline(&self) -> Result<(), Error> {
+        for dir in [&self.audio_location, &self.offline_location]
+            .into_iter()
+            .flatten()
+        {
+            match fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     pub fn remove_file(&self, file: FileId) -> Result<(), Error> {
@@ -498,5 +627,68 @@ mod test {
         limiter.add(Path::new("f"), 500, ordered_time(2));
         assert!(limiter.remove(Path::new("c")));
         assert!(!limiter.exceeds_limit());
+    }
+
+    #[test]
+    fn offline_records_require_complete_audio_and_disappear_on_signout() {
+        let root = std::env::temp_dir().join(format!("q2-cache-test-{}", std::process::id()));
+        let audio = root.join("files");
+        let cache = Cache::new(Some(&root), Some(&root), Some(&audio), Some(12)).unwrap();
+        let record = |n: u8, played_at| OfflineTrack {
+            account: "alice".into(),
+            uri: format!("spotify:track:{n:022}"),
+            file: [n; 20],
+            format: 1,
+            key: Some([n; 16]),
+            title: format!("Track {n}"),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 1000,
+            is_explicit: false,
+            played_at,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A day-old record without its audio is pruned: audio arriving later doesn't bring it back.
+        let stale = record(3, now - 2 * 86_400);
+        cache.save_offline_track(&stale).unwrap();
+        assert!(cache.offline_tracks("alice").is_empty());
+        cache.save_file(FileId(stale.file), &mut &b"1"[..]).unwrap();
+        assert!(cache.offline_tracks("alice").is_empty());
+        cache.remove_file(FileId(stale.file)).unwrap();
+        let a = record(1, now);
+        cache.save_offline_track(&a).unwrap();
+        assert!(cache.offline_tracks("alice").is_empty());
+        let path = cache.file_path(FileId(a.file)).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path.with_extension("tmp"), b"partial").unwrap();
+        assert!(cache.offline_tracks("alice").is_empty());
+        cache
+            .save_file(FileId(a.file), &mut &b"12345678"[..])
+            .unwrap();
+        assert_eq!(cache.offline_tracks("alice").len(), 1);
+        assert!(cache.offline_tracks("bob").is_empty());
+        let b = record(2, now + 1);
+        cache.save_offline_track(&b).unwrap();
+        cache
+            .save_file(FileId(b.file), &mut &b"abcdefgh"[..])
+            .unwrap();
+        assert_eq!(cache.offline_tracks("alice")[0].uri, b.uri);
+        assert_eq!(cache.offline_tracks("alice").len(), 1); // oldest file evicted
+        let recovered = Cache::new(Some(&root), Some(&root), Some(&audio), Some(12)).unwrap();
+        assert_eq!(recovered.offline_tracks("alice").len(), 1);
+        recovered
+            .save_offline_cover("abcdefghijklmnopqrstuv", b"jpeg")
+            .unwrap();
+        assert_eq!(
+            recovered.offline_cover("abcdefghijklmnopqrstuv"),
+            Some(b"jpeg".to_vec())
+        );
+        recovered.clear_offline().unwrap();
+        assert!(recovered.offline_tracks("alice").is_empty());
+        assert!(recovered.offline_cover("abcdefghijklmnopqrstuv").is_none());
+        let _ = fs::remove_dir_all(root);
     }
 }

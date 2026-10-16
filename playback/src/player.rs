@@ -24,7 +24,9 @@ use crate::{
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
-    core::{Error, Session, SpotifyId, SpotifyUri, util::SeqGenerator},
+    core::{
+        Error, FileId, Session, SpotifyId, SpotifyUri, cache::OfflineTrack, util::SeqGenerator,
+    },
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
@@ -35,6 +37,7 @@ use futures_util::{
     stream::futures_unordered::FuturesUnordered,
 };
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
@@ -984,20 +987,54 @@ impl PlayerTrackLoader {
             }
         };
 
-        let audio_item = match AudioItem::get_file(&self.session, track_uri).await {
-            Ok(audio) => match self.find_available_alternative(audio).await {
-                Some(audio) => audio,
-                None => {
-                    warn!(
-                        "spotify:track:<{}> is not available",
-                        track_id.to_base62().unwrap_or_default()
-                    );
+        let saved = self.session.cache().and_then(|cache| {
+            cache
+                .offline_tracks(&self.session.username())
+                .into_iter()
+                .find(|item| item.uri == track_uri.to_uri().unwrap_or_default())
+        });
+        let audio_item = if let Some(item) = saved.as_ref() {
+            let mut files = AudioFiles::default();
+            files.insert(
+                AudioFileFormat::try_from(item.format).ok()?,
+                FileId(item.file),
+            );
+            AudioItem {
+                track_id: track_uri.clone(),
+                uri: item.uri.clone(),
+                files,
+                name: item.title.clone(),
+                covers: Vec::new(),
+                language: Vec::new(),
+                duration_ms: item.duration_ms,
+                is_explicit: item.is_explicit,
+                availability: Ok(()),
+                alternatives: None,
+                unique_fields: UniqueFields::Local {
+                    artists: Some(item.artist.clone()),
+                    album: Some(item.album.clone()),
+                    album_artists: None,
+                    number: None,
+                    disc_number: None,
+                    path: Default::default(),
+                },
+            }
+        } else {
+            match AudioItem::get_file(&self.session, track_uri).await {
+                Ok(audio) => match self.find_available_alternative(audio).await {
+                    Some(audio) => audio,
+                    None => {
+                        warn!(
+                            "spotify:track:<{}> is not available",
+                            track_id.to_base62().unwrap_or_default()
+                        );
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    error!("Unable to load audio item: {e:?}");
                     return None;
                 }
-            },
-            Err(e) => {
-                error!("Unable to load audio item: {e:?}");
-                return None;
             }
         };
 
@@ -1076,13 +1113,64 @@ impl PlayerTrackLoader {
             // Not all audio files are encrypted. If we can't get a key, try loading the track
             // without decryption. If the file was encrypted after all, the decoder will fail
             // parsing and bail out, so we should be safe from outputting ear-piercing noise.
-            let key = match self.session.audio_key().request(track_id, file_id).await {
-                Ok(key) => Some(key),
-                Err(e) => {
-                    warn!("Unable to load key, continuing without decryption: {e}");
-                    None
-                }
+            let cached_key = saved
+                .as_ref()
+                .filter(|item| item.file == file_id.0)
+                .and_then(|item| item.key);
+            let key = match cached_key {
+                Some(key) => Some(librespot_core::audio_key::AudioKey(key)),
+                None => match self.session.audio_key().request(track_id, file_id).await {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        warn!("Unable to load key, continuing without decryption: {e}");
+                        None
+                    }
+                },
             };
+
+            if let Some(cache) = self.session.cache() {
+                let account = self.session.username();
+                // Without a key the file can't be played offline, so it isn't listed.
+                if !account.is_empty() && key.is_some() {
+                    let (artist, album) = match &audio_item.unique_fields {
+                        UniqueFields::Track { artists, album, .. } => (
+                            artists
+                                .0
+                                .iter()
+                                .map(|a| a.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            album.clone(),
+                        ),
+                        UniqueFields::Episode { show_name, .. } => {
+                            (show_name.clone(), String::new())
+                        }
+                        UniqueFields::Local { artists, album, .. } => (
+                            artists.clone().unwrap_or_default(),
+                            album.clone().unwrap_or_default(),
+                        ),
+                    };
+                    let item = OfflineTrack {
+                        account,
+                        uri: audio_item.uri.clone(),
+                        file: file_id.0,
+                        format: format as i32,
+                        key: key.map(|key| key.0),
+                        title: audio_item.name.clone(),
+                        artist,
+                        album,
+                        duration_ms: audio_item.duration_ms,
+                        is_explicit: audio_item.is_explicit,
+                        played_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    };
+                    if let Err(e) = cache.save_offline_track(&item) {
+                        warn!("Could not save offline track: {e}");
+                    }
+                }
+            }
 
             let mut decrypted_file = AudioDecrypt::new(key, encrypted_file);
 

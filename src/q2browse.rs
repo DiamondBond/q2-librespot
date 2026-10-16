@@ -4,8 +4,14 @@
 
 use librespot::{
     connect::{LoadRequest, LoadRequestOptions, PlayingTrack, QueueState, Spirc},
-    core::{Error, Session, SpotifyUri, error::ErrorKind, http_client::HttpClientError},
+    core::{
+        Error, Session, SpotifyUri,
+        cache::{Cache, OfflineTrack},
+        error::ErrorKind,
+        http_client::HttpClientError,
+    },
     metadata::{Album, Artist, Metadata, Track, artist::Artists},
+    playback::player::{Player, PlayerEvent},
     protocol::{
         collection2v2::{CollectionItem, PageResponse},
         extended_metadata::{
@@ -34,7 +40,7 @@ use tokio::{
 };
 
 /// This backend's version, answered by `caps`.
-pub const VERSION: &str = "q2-v1.3";
+pub const VERSION: &str = "q2-v1.4";
 const MAGIC: &str = "Q2SPOT/1";
 const MAX_REQUEST: usize = 8 * 1024;
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -52,7 +58,7 @@ const THROTTLE_DEFAULT: Duration = Duration::from_secs(30);
 const THROTTLE_MAX: Duration = Duration::from_secs(3600);
 
 /// Ops with their minimum and maximum argument counts.
-const OPS: [(&str, usize, usize); 18] = [
+const OPS: [(&str, usize, usize); 20] = [
     ("caps", 0, 0),
     ("account", 0, 0),
     ("playlists", 0, 1),
@@ -71,9 +77,190 @@ const OPS: [(&str, usize, usize); 18] = [
     ("shuffle", 1, 1),
     ("repeat", 1, 1),
     ("signout", 0, 0),
+    ("downloaded", 0, 1),
+    ("playdownload", 1, 1),
 ];
 /// Ops a newer request never aborts.
-const MUTATING: [&str; 6] = ["play", "skip", "enqueue", "shuffle", "repeat", "signout"];
+const MUTATING: [&str; 7] = [
+    "play",
+    "skip",
+    "enqueue",
+    "shuffle",
+    "repeat",
+    "signout",
+    "playdownload",
+];
+
+pub struct OfflinePlayback {
+    cache: Option<Cache>,
+    player: Arc<Player>,
+    current: Mutex<Option<OfflineQueue>>,
+}
+
+struct OfflineQueue {
+    uris: Vec<String>,
+    at: usize,
+    playing: bool,
+    /// Its load's play request id, once the player reports it; `loading` until then.
+    id: Option<u64>,
+    loading: bool,
+}
+
+impl OfflinePlayback {
+    pub fn new(cache: Option<Cache>, player: Arc<Player>) -> Arc<Self> {
+        let this = Arc::new(Self {
+            cache,
+            player: player.clone(),
+            current: Mutex::new(None),
+        });
+        let (weak, mut events) = (Arc::downgrade(&this), player.get_player_event_channel());
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let Some(this) = weak.upgrade() else { break };
+                this.event(event);
+            }
+        });
+        this
+    }
+
+    /// The list goes on at its track's end, and gives the keys back once anything else loads
+    /// (Connect from the phone, a browser play).
+    fn event(&self, event: PlayerEvent) {
+        let mut current = self.current.lock().unwrap();
+        let Some(queue) = current.as_mut() else {
+            return;
+        };
+        let keep = match event {
+            PlayerEvent::PlayRequestIdChanged { play_request_id } => {
+                queue.id = Some(play_request_id);
+                std::mem::take(&mut queue.loading)
+            }
+            PlayerEvent::EndOfTrack {
+                play_request_id, ..
+            } if queue.id == Some(play_request_id) => self.step(queue, true),
+            _ => true,
+        };
+        if !keep {
+            *current = None;
+        }
+    }
+
+    /// Loads the next (or previous) track of the captured list that is still cached, skipping
+    /// evicted ones; false when there is none.
+    fn step(&self, queue: &mut OfflineQueue, forward: bool) -> bool {
+        let cached: Vec<String> = self.tracks().into_iter().map(|item| item.uri).collect();
+        let mut at = queue.at;
+        loop {
+            at = match if forward {
+                at.checked_add(1)
+            } else {
+                at.checked_sub(1)
+            } {
+                Some(at) if at < queue.uris.len() => at,
+                _ => return false,
+            };
+            if !cached.contains(&queue.uris[at]) {
+                continue;
+            }
+            if let Ok(id) = SpotifyUri::from_uri(&queue.uris[at]) {
+                (queue.at, queue.playing, queue.loading) = (at, true, true);
+                self.player.load(id, true, 0);
+                return true;
+            }
+        }
+    }
+
+    fn tracks(&self) -> Vec<OfflineTrack> {
+        let Some(cache) = &self.cache else {
+            return Vec::new();
+        };
+        let account = cache
+            .credentials()
+            .and_then(|c| c.username)
+            .unwrap_or_default();
+        cache.offline_tracks(&account)
+    }
+
+    fn page(&self, cursor: &str) -> Result<Page, Fail> {
+        let from = offset(cursor)?;
+        let tracks = self.tracks();
+        let rows = tracks
+            .iter()
+            .skip(from)
+            .take(PAGE)
+            .enumerate()
+            .map(|(i, item)| Row {
+                title: item.title.clone(),
+                subtitle: item.artist.clone(),
+                after: (from + i + 1).to_string(),
+                ..row("track", item.uri.clone(), "", None)
+            })
+            .collect();
+        let end = from.saturating_add(PAGE);
+        Ok(Page {
+            rows,
+            cursor: cursor_at(end, end < tracks.len()),
+            ..Default::default()
+        })
+    }
+
+    fn play(&self, uri: &str) -> Result<Page, Fail> {
+        uri_of(uri, "track")?;
+        let tracks = self.tracks();
+        let Some(at) = tracks.iter().position(|item| item.uri == uri) else {
+            return Err(fail(Status::Unavailable));
+        };
+        let id = SpotifyUri::from_uri(uri).map_err(|_| fail(Status::Bad))?;
+        *self.current.lock().unwrap() = Some(OfflineQueue {
+            uris: tracks.into_iter().map(|item| item.uri).collect(),
+            at,
+            playing: true,
+            id: None,
+            loading: true,
+        });
+        self.player.load(id, true, 0);
+        Ok(Page::default())
+    }
+
+    pub fn control(&self, command: &[u8]) -> bool {
+        let mut current = self.current.lock().unwrap();
+        let Some(queue) = current.as_mut() else {
+            return false;
+        };
+        match command {
+            b"p" => {
+                queue.playing = !queue.playing;
+                if queue.playing {
+                    self.player.play();
+                } else {
+                    self.player.pause();
+                }
+            }
+            b"P" => {
+                queue.playing = true;
+                self.player.play();
+            }
+            b"s" => {
+                queue.playing = false;
+                self.player.pause();
+            }
+            b"n" | b"b" => {
+                self.step(queue, command == b"n");
+            }
+            [b'S', ms @ ..] => {
+                if let Ok(ms) = std::str::from_utf8(ms).unwrap_or_default().parse() {
+                    self.player.seek(ms);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    pub fn end(&self) {
+        *self.current.lock().unwrap() = None;
+    }
+}
 
 /// Throttle deadlines: spclient, and Pathfinder (search) on its own host.
 static THROTTLED: Mutex<[Option<Instant>; 2]> = Mutex::new([None; 2]);
@@ -343,7 +530,12 @@ fn encode(id: &str, result: Result<Page, Fail>) -> Vec<u8> {
 
 /// Binds `path` and answers each connection in its own task. A new connection aborts the
 /// previous read-only request: the client has given up on it.
-pub fn serve(path: &Path, link: watch::Receiver<Link>, signout: Signout) {
+pub fn serve(
+    path: &Path,
+    link: watch::Receiver<Link>,
+    signout: Signout,
+    offline: Arc<OfflinePlayback>,
+) {
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
         Ok(listener) => listener,
@@ -364,6 +556,7 @@ pub fn serve(path: &Path, link: watch::Receiver<Link>, signout: Signout) {
                         stream,
                         link.clone(),
                         signout.clone(),
+                        offline.clone(),
                         abortable.clone(),
                     ));
                     last = Some((task.abort_handle(), abortable));
@@ -381,6 +574,7 @@ async fn answer(
     mut stream: UnixStream,
     mut link: watch::Receiver<Link>,
     signout: Signout,
+    offline: Arc<OfflinePlayback>,
     abortable: Arc<AtomicBool>,
 ) {
     let deadline = tokio::time::Instant::now() + DEADLINE;
@@ -397,7 +591,21 @@ async fn answer(
         Err(id) => (id, Err(fail(Status::Bad))),
         Ok(request) => {
             abortable.store(!MUTATING.contains(&request.op.as_str()), Ordering::Relaxed);
-            let run = run(&request, &mut link, &signout, &mut flushed);
+            let run = async {
+                match request.op.as_str() {
+                    "downloaded" if request.args.len() <= 1 => {
+                        offline.page(request.args.first().map(String::as_str).unwrap_or_default())
+                    }
+                    "playdownload" if request.args.len() == 1 => offline.play(&request.args[0]),
+                    "account"
+                        if !offline.tracks().is_empty()
+                            && !matches!(&*link.borrow(), Link::Ready(..)) =>
+                    {
+                        Ok(Page::default())
+                    }
+                    _ => run(&request, &mut link, &signout, &mut flushed).await,
+                }
+            };
             let result = tokio::time::timeout_at(deadline, run)
                 .await
                 .unwrap_or_else(|_| {
@@ -406,6 +614,9 @@ async fn answer(
                         "Spotify didn't answer in time".into(),
                     ))
                 });
+            if result.is_ok() && matches!(request.op.as_str(), "play" | "skip") {
+                offline.end();
+            }
             (request.id, result)
         }
     };
