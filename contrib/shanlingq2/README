@@ -65,11 +65,12 @@ librespot is started with:
       this branch: datagrams 'p' play/pause, 'P' play, 's' pause,
       'n' next, 'b' previous, 'S' and ms to seek, from the Q2's keys
   --browse-socket /tmp/q2-librespot.browse.sock
-      this branch (q2-v1.4): Q2 Pod's Spotify browser, a stream socket
+      this branch (q2-v1.5): Q2 Pod's Spotify browser, a stream socket
       with one request and one response per connection (Q2SPOT/1:
       playlists, Liked Songs, albums, artists, search, play, queue,
       shuffle, repeat, downloaded tracks, sign out); the protocol is in
-      q2-pod's docs/librespot.md. Complete audio files are capped at 2 GB,
+      q2-pod's docs/librespot.md. Complete audio files are capped at 2 GB, or
+      .spotify/.cache-size (Q2 Pod's Streaming > Configuration),
       and saved track metadata, keys and artwork allow offline replay.
       Sign out deletes the login, cached audio, keys and artwork
 

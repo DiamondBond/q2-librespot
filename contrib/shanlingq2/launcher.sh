@@ -3,13 +3,16 @@
 # is first opened. librespot restarts after any exit (mDNS needs Wi-Fi up), backing
 # off to a minute while it keeps failing. /tmp/q2-librespot, the restart loop's pid, makes a second
 # run exit and lets Q2 Pod stop it. With a file named debug here, load.log gets the load and
-# librespot's memory every 10 s.
+# librespot's memory every 10 s. .cache-size, which Q2 Pod's Streaming > Configuration writes
+# ("4096M"), caps the audio cache, read at each start; 2G when it is missing or malformed.
 cd /mnt/mmc/.spotify || exit 1
 [ -e /tmp/q2-librespot ] && exit 0
 wait=5
 while :; do
     start=$(date +%s)
-    ./librespot -n Q2 -b 160 --cache ./cache --cache-size-limit 2G \
+    limit=$(cat .cache-size 2>/dev/null)
+    case $limit in '' | [!0-9]* | *[!0-9KMG]* | *[KMG]?*) limit=2G ;; esac
+    ./librespot -n Q2 -b 160 --cache ./cache --cache-size-limit "$limit" \
         --backend subprocess --device "/bin/sh ./aplay.sh" \
         --volume-ctrl fixed --initial-volume 100 \
         --control-socket /tmp/q2-librespot.sock --status-file /tmp/q2-librespot.state \
