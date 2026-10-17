@@ -284,6 +284,7 @@ pub struct Cache {
     volume_location: Option<PathBuf>,
     audio_location: Option<PathBuf>,
     offline_location: Option<PathBuf>,
+    offline_write: Arc<Mutex<()>>,
     size_limiter: Option<Arc<FsSizeLimiter>>,
 }
 
@@ -328,6 +329,7 @@ impl Cache {
             offline_location: credentials_path
                 .as_ref()
                 .map(|p| p.as_ref().join("offline")),
+            offline_write: Arc::new(Mutex::new(())),
             size_limiter,
         };
 
@@ -469,6 +471,7 @@ impl Cache {
     }
 
     pub fn save_offline_track(&self, track: &OfflineTrack) -> Result<(), Error> {
+        let _write = self.offline_write.lock().unwrap();
         let dir = self.offline_location.as_ref().ok_or(CacheError::Path)?;
         fs::create_dir_all(dir)?;
         let name = FileId(track.file).to_base16()?;
@@ -627,6 +630,46 @@ mod test {
         limiter.add(Path::new("f"), 500, ordered_time(2));
         assert!(limiter.remove(Path::new("c")));
         assert!(!limiter.exceeds_limit());
+    }
+
+    #[test]
+    fn cloned_caches_serialize_offline_metadata_writes() {
+        let root = std::env::temp_dir().join(format!("q2-cache-writers-{}", std::process::id()));
+        let cache = Cache::new(Some(&root), Some(&root), Some(&root.join("audio")), None).unwrap();
+        let record = OfflineTrack {
+            account: "alice".into(),
+            uri: "spotify:track:0000000000000000000001".into(),
+            file: [1; 20],
+            format: 1,
+            key: Some([2; 16]),
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 1,
+            is_explicit: false,
+            played_at: 0,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (cache, record, barrier) = (cache.clone(), record.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..64 {
+                        cache.save_offline_track(&record).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let path = root
+            .join("offline")
+            .join(FileId(record.file).to_base16().unwrap());
+        let saved: OfflineTrack = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.uri, record.uri);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

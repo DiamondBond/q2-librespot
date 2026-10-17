@@ -65,14 +65,21 @@ librespot is started with:
       this branch: datagrams 'p' play/pause, 'P' play, 's' pause,
       'n' next, 'b' previous, 'S' and ms to seek, from the Q2's keys
   --browse-socket /tmp/q2-librespot.browse.sock
-      this branch (q2-v1.5): Q2 Pod's Spotify browser, a stream socket
+      this branch (q2-v1.6): Q2 Pod's Spotify browser, a stream socket
       with one request and one response per connection (Q2SPOT/1:
       playlists, Liked Songs, albums, artists, search, play, queue,
-      shuffle, repeat, downloaded tracks, sign out); the protocol is in
+      shuffle, repeat, downloaded tracks, playlist downloads, sign out); the protocol is in
       q2-pod's docs/librespot.md. Complete audio files are capped at 2 GB, or
       .spotify/.cache-size (Q2 Pod's Streaming > Configuration),
       and saved track metadata, keys and artwork allow offline replay.
-      Sign out deletes the login, cached audio, keys and artwork
+      Sign out deletes the login, cached audio, keys and artwork.
+      Q2SPOT/1 download <playlist-uri> starts one background playlist download;
+      downloadstatus returns its progress in the response message. Existing
+      complete tracks are reused. The normal cache cap still applies, so a
+      playlist larger than the cap can evict its earlier tracks.
+      /tmp/q2-librespot.download reports downloading=1 while the job runs,
+      independently of playback, so Q2 Pod keeps the service awake.
+      A saved login opens the offline browser even with no downloaded tracks
 
 Logs go to the card: spot.log, aplay.log. With a file named debug in
 .spotify, load.log gets the load average and librespot's VmRSS every 10 s,

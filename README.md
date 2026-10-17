@@ -10,7 +10,9 @@ This fork runs librespot on the **Shanling Q2** as a Spotify Connect speaker for
 4. Eject the card, put it back in the Q2 and power it on.
 5. Open **Streaming → Spotify** on the Q2, then pick **Q2** in the Spotify app on a phone on the same Wi-Fi. The login is saved in `.spotify/cache/`. After each power-on, open **Streaming → Spotify** once to make the Q2 appear in Spotify again.
 
-To update, replace `.spotify/librespot`, `run` and `aplay.sh` and keep `cache/`. To remove it, delete `.spotify`. Building it yourself and how it works: [contrib/shanlingq2/README](contrib/shanlingq2/README).
+To update, replace `.spotify/librespot`, `run` and `aplay.sh` and keep `cache/`. With q2-librespot v1.6 and a Q2 Pod build supporting playlist downloads, open a Spotify playlist and select **Download Playlist**. **Downloads** shows progress; **Downloaded Tracks** plays complete cached songs without Wi-Fi. The cache limit still applies, so use a cache large enough for the music you want to keep. A saved login opens the offline menu even before any tracks have been cached.
+
+To remove it, delete `.spotify`. Building it yourself and how it works: [contrib/shanlingq2/README](contrib/shanlingq2/README).
 
 ---
 
