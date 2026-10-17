@@ -1,0 +1,5 @@
+#!/bin/sh
+# C compiler for build scripts (ring) on mipsel-q2-linux-gnu: FP64, NaN-2008. glibc headers from
+# MIPSEL_INCLUDE plus build.sh's overlay (Q2_INCLUDE); the host's /usr/include is never searched.
+exec "clang${LLVM:-}" --target=mipsel-linux-gnu -march=mips32r2 -mfp64 -mnan=2008 -mabs=2008 -mabicalls \
+  -nostdlibinc -isystem "$Q2_INCLUDE" -isystem "${MIPSEL_INCLUDE:-/usr/mipsel-linux-gnu/include}" "$@"

@@ -1,0 +1,19 @@
+#!/bin/sh
+# rustc's linker for mipsel-q2-linux-gnu: clang and lld against the Q2's own glibc
+# (Q2_SYSROOT/lib, from the firmware), with start.o in place of crt1.o and no libgcc.
+# rustc writes its own symbols.o without EF_MIPS_NAN2008 (rustc_codegen_ssa's elf_e_flags sets it
+# only for r6 CPUs), and lld refuses it beside NaN-2008 objects. It holds no float code, so the flag
+# is set here. Not named *-ld: rustc would take that for a bare ld and drop the -Wl, prefixes.
+for a in "$@"; do
+  case "$a" in
+    */symbols.o) python3 -I -c 'import struct, sys
+p = sys.argv[1]
+b = bytearray(open(p, "rb").read())
+f, = struct.unpack_from("<I", b, 0x24)
+struct.pack_into("<I", b, 0x24, f | 0x400)
+open(p, "wb").write(b)' "$a" ;;
+  esac
+done
+exec "clang${LLVM:-}" --target=mipsel-linux-gnu -fuse-ld=lld -nostartfiles -nodefaultlibs -no-pie \
+  -Wl,--dynamic-linker=/lib/ld-linux-mipsn8.so.1 -Wl,-z,noexecstack \
+  -L "$Q2_SYSROOT/lib" "$Q2_START" "$@"

@@ -1,21 +1,27 @@
 Shanling Q2 tools
 =================
 
-The Q2 runs Linux 5.15 on an Ingenic X2000 (MIPS32r2, nan2008, FP64) with
+The Q2 runs Linux 5.10 on an Ingenic X2000 (MIPS32r2, nan2008, FP64) with
 glibc 2.28, no IPv6 and no CA bundle. librespot runs from the card's .spotify
 folder as a Spotify Connect receiver beside the stock player, and Q2 Pod
 (https://github.com/DiamondBond/q2-pod) starts it, shows what it plays on
 Streaming -> Spotify, and hands it the keys, the DAC and the power timers.
 Nothing is flashed for it.
 
-  build.sh     static soft-float build and the card files, in
-               target/shanlingq2/.spotify (copy that folder to the card's root)
+  build.sh     hard-float build against the Q2's own glibc, and the card files,
+               in target/shanlingq2/.spotify (copy that folder to the card's root)
   launcher.sh  installed as .spotify/run: librespot in a restart loop, in the
                background, once per boot
   aplay.sh     the subprocess sink: the stock aplay on plughw:0,0, retried for
                3 s while local music lets the PCM go; Q2 Pod's q2video -s on
                the device /tmp/q2-librespot.out names (Bluetooth, USB DAC)
-  nan2008.py   sets EF_MIPS_NAN2008 in an ELF's flags
+  mipsel-q2-linux-gnu.json
+               the Rust target: MIPS32r2, FP64, NaN-2008, glibc
+  q2-cc, q2-link
+               the target's C compiler (ring) and linker, clang and lld
+  start.c, nonshared.c
+               what the rootfs lacks to link against: crt1.o's __start and
+               libc_nonshared.a's stat64 family and pthread_atfork
 
 Install
 -------
@@ -27,18 +33,37 @@ root with the Q2 powered off. See the top-level README.md.
 Build
 -----
 
-Rust nightly with rust-src (mipsel-unknown-linux-musl is tier 3, so std is
-built with -Zbuild-std) and musl.cc's mipsel-linux-muslsf-cross:
+Rust nightly with rust-src (std is built with -Zbuild-std for the custom
+target), clang, lld, llvm-ar and llvm-strip 18 or later, unsquashfs, python3,
+MIPS glibc headers for ring's C code, and Shanling's Q2 V1.32 firmware ZIP,
+whose rootfs supplies the libraries the binary links against:
 
   rustup toolchain install nightly --profile minimal --component rust-src
-  contrib/shanlingq2/build.sh ~/x-tools/mipsel-linux-muslsf-cross
+  sudo apt install clang lld llvm squashfs-tools libc6-dev-mipsel-cross
+  LLVM_SUFFIX=-18 contrib/shanlingq2/build.sh 'Q2 Firmware V1.32.zip'
 
-Static and soft-float, the binary needs none of the device's glibc, its
-nan2008 interpreter or FR=1 mode. The kernel still refuses an ELF without the
-nan2008 flag (the shell then reports 'syntax error: unexpected "("'); soft
-float has no FPU instructions, so nan2008.py sets it. The tier-3 target ships
-no crt objects or libunwind, so the link uses the toolchain's crt files and
-its libgcc_eh as libunwind. TLS is rustls with webpki's compiled-in roots.
+(LLVM_SUFFIX only where the LLVM tools carry their version, as on Ubuntu.)
+
+The binary is hard float for the X2000's FPU: FP64 (FR=1) and NaN-2008, the
+ABI of the stock binaries, dynamically linked against the Q2's glibc 2.28
+through /lib/ld-linux-mipsn8.so.1, as Q2 Pod's own helpers are. Rust has no
+such target: mipsel-q2-linux-gnu.json is mipsel-unknown-linux-gnu with its
++fpxx,+nooddspreg (and legacy NaN) replaced by +fp64,+nan2008,+abs2008, PIE off,
+and q2-link as a gnu-cc linker. The rootfs has no crt1.o or libc_nonshared.a:
+q2-link puts start.o in crt1.o's place, and build.sh writes glibc's usual
+libc.so linker script around libc.so.6 and nonshared.c's archive. rustc marks
+its own symbols.o NaN-2008 only for r6 CPUs, so q2-link sets the flag on it (it
+holds no float code). Cargo does not see start.o, the archive or q2-link: after
+editing them, delete target/mipsel-q2-linux-gnu so librespot is linked again.
+librespot-core enables num-traits' std feature, so the TPDF dither's square
+root is the FPU's sqrt.d. TLS is rustls with webpki's compiled-in roots.
+
+Measured with a harness running librespot's decode chain (Symphonia Vorbis into
+f64, TPDF dither, S16) built both ways with a fixed dither seed: the hard-float
+PCM is bit-identical to the soft-float PCM (on the Q2 and in QEMU), and 30 s of
+Vorbis took 9.4 s of CPU soft-float and 0.86 s hard-float on the Q2 at
+160 kbit/s (9.5 and 0.92 s at 320), so decoding drops from about 31% to 3% of a
+core. Whole-process CPU during real Spotify playback is not measured yet.
 
 Device
 ------
@@ -92,8 +117,10 @@ Status
 ------
 
 Works on the device: discovery, a Connect session from the phone and audio
-on the headphones at 160 kbit/s, decoded in soft float, with no stutter
-reported. Q2 Pod's integration (the page, keys, volume, standby, DAC and the
+on the headphones at 160 kbit/s, with no stutter reported, all verified with
+the earlier soft-float build. The hard-float build has so far been run on the
+Q2 only as far as start-up (discovery up, player initialised, TPDF dither, S16
+sink). Q2 Pod's integration (the page, keys, volume, standby, DAC and the
 hand-over with local music) is described in q2-pod's docs/internals.md
 (Spotify). With Bluetooth or a USB DAC as the Q2's output, Q2 Pod writes
 /tmp/q2-librespot.out ("plug:bluealsa 42": the ALSA device and the volume,
