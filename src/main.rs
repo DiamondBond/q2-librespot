@@ -1918,6 +1918,8 @@ async fn main() {
     const RECONNECT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(600);
     const DISCOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
     const RECONNECT_RATE_LIMIT: usize = 5;
+    const CONNECT_RETRY_MIN: Duration = Duration::from_secs(10);
+    const CONNECT_RETRY_MAX: Duration = Duration::from_secs(60);
 
     if env::var(RUST_BACKTRACE).is_err() {
         set_env_var(RUST_BACKTRACE, "full").await;
@@ -1930,6 +1932,7 @@ async fn main() {
     let mut spirc_task: Option<Pin<_>> = None;
     let mut auto_connect_times: Vec<Instant> = vec![];
     let mut next_connect = Instant::now();
+    let mut connect_retry = CONNECT_RETRY_MIN;
     let mut discovery = None;
     let mut connecting = false;
     let mut _event_handler: Option<EventHandler> = None;
@@ -2116,6 +2119,7 @@ async fn main() {
 
                         connecting = true;
                         next_connect = Instant::now(); // a new pairing waits out no earlier retry
+                        connect_retry = CONNECT_RETRY_MIN;
                         q2browse::forget_throttling();
                         link.send_replace(q2browse::Link::Connecting);
                     },
@@ -2165,8 +2169,14 @@ async fn main() {
                                                                 mixer.clone()).await {
                     Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
                     Err(e) => {
-                        warn!("Could not connect to Spotify, retrying: {e}");
-                        next_connect = Instant::now() + Duration::from_secs(10);
+                        warn!("Could not connect to Spotify, retrying in {} s: {e}", connect_retry.as_secs());
+                        // Spirc::new registers its dealer handlers before any network call, so a
+                        // retry on this Session would only fail with "request was already handled".
+                        if !session.is_invalid() {
+                            session.shutdown();
+                        }
+                        next_connect = Instant::now() + connect_retry;
+                        connect_retry = (connect_retry * 2).min(CONNECT_RETRY_MAX);
                         continue;
                     }
                 };
@@ -2175,6 +2185,7 @@ async fn main() {
                 spirc_task = Some(Box::pin(spirc_task_));
 
                 connecting = false;
+                connect_retry = CONNECT_RETRY_MIN;
             },
             _ = async {
                 if let Some(task) = spirc_task.as_mut() {
@@ -2200,6 +2211,9 @@ async fn main() {
                     link.send_replace(q2browse::Link::Connecting);
                 } else {
                     warn!("Spirc shut down too often; retrying in 30 s.");
+                    if !session.is_invalid() {
+                        session.shutdown();
+                    }
                     connecting = last_credentials.is_some();
                     next_connect = Instant::now() + Duration::from_secs(30);
                     link.send_replace(q2browse::Link::Connecting);
