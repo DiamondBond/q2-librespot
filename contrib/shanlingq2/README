@@ -117,10 +117,8 @@ Status
 ------
 
 Works on the device: discovery, a Connect session from the phone and audio
-on the headphones at 160 kbit/s, with no stutter reported, all verified with
-the earlier soft-float build. The hard-float build has so far been run on the
-Q2 only as far as start-up (discovery up, player initialised, TPDF dither, S16
-sink). Q2 Pod's integration (the page, keys, volume, standby, DAC and the
+on the headphones at 160 kbit/s, with no stutter reported. The hard-float
+build (q2-v1.7) was tested on the Q2 with Spotify playback before release. Q2 Pod's integration (the page, keys, volume, standby, DAC and the
 hand-over with local music) is described in q2-pod's docs/internals.md
 (Spotify). With Bluetooth or a USB DAC as the Q2's output, Q2 Pod writes
 /tmp/q2-librespot.out ("plug:bluealsa 42": the ALSA device and the volume,
