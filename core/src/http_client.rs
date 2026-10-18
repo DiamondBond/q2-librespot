@@ -266,20 +266,6 @@ impl HttpClient {
         Ok(self.hyper_client().request(req.map(Full::new)))
     }
 
-    pub fn get_retry_after(headers: &HeaderMap<HeaderValue>) -> Option<Duration> {
-        let duration = Self::retry_after(headers)?;
-        if duration <= RATE_LIMIT_MAX_WAIT {
-            Some(duration)
-        } else {
-            debug!(
-                "Waiting {} seconds would exceed {} second limit",
-                duration.as_secs(),
-                RATE_LIMIT_MAX_WAIT.as_secs()
-            );
-            None
-        }
-    }
-
     /// How long a rate-limited response asks us to wait, however long that is.
     pub fn retry_after(headers: &HeaderMap<HeaderValue>) -> Option<Duration> {
         let now = Date::now_utc().as_timestamp_ms();

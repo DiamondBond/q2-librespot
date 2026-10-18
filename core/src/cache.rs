@@ -26,7 +26,15 @@ pub struct OfflineTrack {
     pub album: String,
     pub duration_ms: u32,
     pub is_explicit: bool,
+    /// Unix time in milliseconds.
     pub played_at: u64,
+}
+
+/// Now, as Unix time in milliseconds (`OfflineTrack::played_at`).
+pub fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
@@ -491,9 +499,7 @@ impl Cache {
             return Vec::new();
         };
         let mut tracks = Vec::new();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now = unix_ms();
         for entry in entries.flatten() {
             if !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
@@ -512,7 +518,7 @@ impl Cache {
             };
             if path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
                 tracks.push(track);
-            } else if now.saturating_sub(track.played_at) > 86_400 {
+            } else if now.saturating_sub(track.played_at) > 86_400_000 {
                 // Evicted audio: its record and art go too, so they stay within the audio's count.
                 // A day's grace, so a download still running keeps the key it will need.
                 let _ = fs::remove_file(entry.path());
@@ -690,14 +696,19 @@ mod test {
             is_explicit: false,
             played_at,
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_ms();
         // A day-old record without its audio is pruned: audio arriving later doesn't bring it back.
-        let stale = record(3, now - 2 * 86_400);
+        let stale = record(3, now - 2 * 86_400_000);
         cache.save_offline_track(&stale).unwrap();
+        let fresh = record(4, now);
+        cache.save_offline_track(&fresh).unwrap();
+        let record_path = |t: &OfflineTrack| {
+            root.join("offline")
+                .join(FileId(t.file).to_base16().unwrap())
+        };
         assert!(cache.offline_tracks("alice").is_empty());
+        assert!(!record_path(&stale).exists());
+        assert!(record_path(&fresh).exists()); // within its day's grace
         cache.save_file(FileId(stale.file), &mut &b"1"[..]).unwrap();
         assert!(cache.offline_tracks("alice").is_empty());
         cache.remove_file(FileId(stale.file)).unwrap();

@@ -2,18 +2,18 @@
 //! response per connection, described in q2-pod's docs/librespot.md. It shares the main loop's
 //! session and Spirc, and keeps nothing between requests: cursors carry the paging state.
 
+use crate::status_file::write_atomic;
 use librespot::{
     audio::AudioFile,
     connect::{LoadRequest, LoadRequestOptions, PlayingTrack, QueueState, Spirc},
     core::{
         Error, Session, SpotifyUri,
-        cache::{Cache, OfflineTrack},
+        cache::{Cache, OfflineTrack, unix_ms},
         error::ErrorKind,
         http_client::HttpClientError,
     },
     metadata::{
         Album, Artist, Metadata, Track,
-        artist::Artists,
         audio::{AudioFileFormat, AudioItem, UniqueFields},
     },
     playback::player::{Player, PlayerEvent},
@@ -36,7 +36,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -62,41 +62,31 @@ const SAVED_MAX: usize = 1000;
 const THROTTLE_DEFAULT: Duration = Duration::from_secs(30);
 const THROTTLE_MAX: Duration = Duration::from_secs(3600);
 
-/// Ops with their minimum and maximum argument counts.
-const OPS: [(&str, usize, usize); 22] = [
-    ("caps", 0, 0),
-    ("account", 0, 0),
-    ("playlists", 0, 1),
-    ("playlist", 1, 2),
-    ("liked", 0, 1),
-    ("albums", 0, 1),
-    ("artists", 0, 1),
-    ("album", 1, 2),
-    ("artist", 1, 1),
-    ("search", 2, 3),
-    ("play", 1, 3),
-    ("queue", 0, 0),
-    ("skip", 2, 2),
-    ("enqueue", 1, 1),
-    ("settings", 0, 0),
-    ("shuffle", 1, 1),
-    ("repeat", 1, 1),
-    ("signout", 0, 0),
-    ("downloaded", 0, 1),
-    ("playdownload", 1, 1),
-    ("download", 1, 1),
-    ("downloadstatus", 0, 0),
-];
-/// Ops a newer request never aborts.
-const MUTATING: [&str; 8] = [
-    "play",
-    "skip",
-    "enqueue",
-    "shuffle",
-    "repeat",
-    "signout",
-    "playdownload",
-    "download",
+/// Ops with their minimum and maximum argument counts, and whether they mutate (a newer
+/// request never aborts those).
+const OPS: [(&str, usize, usize, bool); 22] = [
+    ("caps", 0, 0, false),
+    ("account", 0, 0, false),
+    ("playlists", 0, 1, false),
+    ("playlist", 1, 2, false),
+    ("liked", 0, 1, false),
+    ("albums", 0, 1, false),
+    ("artists", 0, 1, false),
+    ("album", 1, 2, false),
+    ("artist", 1, 1, false),
+    ("search", 2, 3, false),
+    ("play", 1, 3, true),
+    ("queue", 0, 0, false),
+    ("skip", 2, 2, true),
+    ("enqueue", 1, 1, true),
+    ("settings", 0, 0, false),
+    ("shuffle", 1, 1, true),
+    ("repeat", 1, 1, true),
+    ("signout", 0, 0, true),
+    ("downloaded", 0, 1, false),
+    ("playdownload", 1, 1, true),
+    ("download", 1, 1, true),
+    ("downloadstatus", 0, 0, false),
 ];
 
 pub struct OfflinePlayback {
@@ -106,7 +96,6 @@ pub struct OfflinePlayback {
     download: Mutex<Download>,
 }
 
-#[derive(Default)]
 struct Download {
     task: Option<tokio::task::JoinHandle<()>>,
     message: String,
@@ -117,11 +106,8 @@ struct Download {
 const DOWNLOAD_FILE: &str = "/tmp/q2-librespot.download";
 
 fn download_state(running: bool, message: &str) {
-    let tmp = format!("{DOWNLOAD_FILE}.tmp");
     let text = format!("downloading={}\nmessage={}\n", u8::from(running), message);
-    if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, DOWNLOAD_FILE)) {
-        warn!("Could not write download state: {e}");
-    }
+    write_atomic(Path::new(DOWNLOAD_FILE), text.as_bytes());
 }
 
 struct OfflineQueue {
@@ -139,9 +125,12 @@ impl OfflinePlayback {
             cache,
             player: player.clone(),
             current: Mutex::new(None),
-            download: Mutex::new(Download::default()),
+            download: Mutex::new(Download {
+                task: None,
+                message: "No playlist download started".into(),
+            }),
         });
-        download_state(false, "No playlist download started");
+        download_state(false, &this.download.lock().unwrap().message);
         let (weak, mut events) = (Arc::downgrade(&this), player.get_player_event_channel());
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -287,13 +276,8 @@ impl OfflinePlayback {
     }
 
     fn download_status(&self) -> Page {
-        let download = self.download.lock().unwrap();
         Page {
-            message: if download.message.is_empty() {
-                "No playlist download started".into()
-            } else {
-                download.message.clone()
-            },
+            message: self.download.lock().unwrap().message.clone(),
             ..Default::default()
         }
     }
@@ -440,18 +424,10 @@ async fn download_track(session: &Session, uri: &str) -> Result<(), Fail> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let (artist, album) = match item.unique_fields {
-        UniqueFields::Track { artists, album, .. } => (
-            artists
-                .0
-                .iter()
-                .map(|artist| artist.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            album,
-        ),
-        _ => return Err(fail(Status::Unavailable)),
-    };
+    if !matches!(item.unique_fields, UniqueFields::Track { .. }) {
+        return Err(fail(Status::Unavailable));
+    }
+    let (artist, album) = item.unique_fields.artist_album();
     cache.save_offline_track(&OfflineTrack {
         account: session.username(),
         uri: item.uri,
@@ -463,10 +439,7 @@ async fn download_track(session: &Session, uri: &str) -> Result<(), Fail> {
         album,
         duration_ms: item.duration_ms,
         is_explicit: item.is_explicit,
-        played_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
+        played_at: unix_ms(),
     })?;
     Ok(())
 }
@@ -804,21 +777,14 @@ async fn answer(
     let (id, result) = match parse(&buf) {
         Err(id) => (id, Err(fail(Status::Bad))),
         Ok(request) => {
-            abortable.store(!MUTATING.contains(&request.op.as_str()), Ordering::Relaxed);
+            let mutating = OPS.iter().any(|&(name, .., m)| m && name == request.op);
+            abortable.store(!mutating, Ordering::Relaxed);
             let run = async {
                 match request.op.as_str() {
-                    "downloaded" if request.args.len() <= 1 => {
-                        offline.page(request.args.first().map(String::as_str).unwrap_or_default())
-                    }
-                    "playdownload" if request.args.len() == 1 => offline.play(&request.args[0]),
-                    "download" if request.args.len() == 1 => {
-                        offline.download(&request.args[0], &mut link).await
-                    }
-                    "downloadstatus" if request.args.is_empty() => Ok(offline.download_status()),
                     "account" if offline_account(offline.cache.as_ref(), &link.borrow()) => {
                         Ok(Page::default())
                     }
-                    _ => run(&request, &mut link, &signout, &mut flushed).await,
+                    _ => run(&request, &mut link, &signout, &offline, &mut flushed).await,
                 }
             };
             let result = tokio::time::timeout_at(deadline, run)
@@ -844,10 +810,11 @@ async fn run(
     request: &Request,
     link: &mut watch::Receiver<Link>,
     signout: &Signout,
+    offline: &Arc<OfflinePlayback>,
     flushed: &mut Option<oneshot::Sender<()>>,
 ) -> Result<Page, Fail> {
     let Request { op, args, .. } = request;
-    let Some(&(_, min, max)) = OPS.iter().find(|(name, ..)| name == op) else {
+    let Some(&(_, min, max, _)) = OPS.iter().find(|(name, ..)| name == op) else {
         return Err(fail(Status::Unsupported));
     };
     if args.len() < min || args.len() > max {
@@ -868,6 +835,10 @@ async fn run(
             signed_out.await.map_err(|_| fail(Status::Error))?;
             return Ok(Page::default());
         }
+        "downloaded" => return offline.page(last),
+        "playdownload" => return offline.play(arg(0)),
+        "download" => return offline.download(arg(0), link).await,
+        "downloadstatus" => return Ok(offline.download_status()),
         _ => {}
     }
     let (session, spirc) = ready(link).await?;
@@ -931,14 +902,6 @@ fn uri_of<'a>(uri: &'a str, kind: &str) -> Result<&'a str, Fail> {
         .and_then(|r| r.strip_prefix(kind)?.strip_prefix(':'))
         .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
         .ok_or_else(|| fail(Status::Bad))
-}
-
-fn names(artists: &Artists) -> String {
-    artists
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// The items in one batched extended-metadata response, by URI. An item that doesn't parse
@@ -1008,14 +971,14 @@ async fn fill<T: Metadata>(
 
 async fn tracks(session: &Session, rows: Vec<Row>) -> Result<Vec<Row>, Fail> {
     fill(session, ExtensionKind::TRACK_V4, rows, |t: &Track| {
-        (t.name.clone(), names(&t.artists))
+        (t.name.clone(), t.artists.names())
     })
     .await
 }
 
 async fn albums(session: &Session, rows: Vec<Row>) -> Result<Vec<Row>, Fail> {
     fill(session, ExtensionKind::ALBUM_V4, rows, |a: &Album| {
-        (a.name.clone(), names(&a.artists))
+        (a.name.clone(), a.artists.names())
     })
     .await
 }
@@ -1602,10 +1565,7 @@ mod tests {
             album: "Album".into(),
             duration_ms: 1000,
             is_explicit: false,
-            played_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            played_at: unix_ms(),
         };
         cache.save_offline_track(&record).unwrap();
         assert!(cache.offline_tracks("alice").is_empty());
@@ -1735,6 +1695,19 @@ mod tests {
 
     #[tokio::test]
     async fn ops_are_checked() {
+        let session = Session::new(Default::default(), None);
+        let player = Player::new(
+            Default::default(),
+            session,
+            Box::new(librespot::playback::mixer::NoOpVolume),
+            || {
+                librespot::playback::audio_backend::find(Some("pipe".into())).unwrap()(
+                    Some("/dev/null".into()),
+                    Default::default(),
+                )
+            },
+        );
+        let offline = OfflinePlayback::new(None, player);
         let (_tx, mut link) = watch::channel(Link::Login);
         let (signout, _rx) = mpsc::unbounded_channel();
         let mut flushed = None;
@@ -1748,11 +1721,11 @@ mod tests {
             ("5\tplay\tspotify:x\t1\turi\textra", Status::Bad),
         ] {
             let request = parse(&request(line)).unwrap();
-            let result = run(&request, &mut link, &signout, &mut flushed).await;
+            let result = run(&request, &mut link, &signout, &offline, &mut flushed).await;
             assert_eq!(result.unwrap_err().0, status, "{line}");
         }
         let request = parse(&request("6\tcaps")).unwrap();
-        let caps = run(&request, &mut link, &signout, &mut flushed)
+        let caps = run(&request, &mut link, &signout, &offline, &mut flushed)
             .await
             .unwrap();
         assert_eq!(caps.message, VERSION);
@@ -2015,7 +1988,7 @@ mod tests {
         response.extended_metadata.push(array);
         let items = parse_items::<Track>(response);
         assert_eq!(items.len(), 1);
-        assert_eq!(names(&items[&uri].artists), "The Fireflies");
+        assert_eq!(items[&uri].artists.names(), "The Fireflies");
     }
 
     #[test]

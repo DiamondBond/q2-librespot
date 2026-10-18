@@ -106,7 +106,8 @@ librespot is started with:
       independently of playback, so Q2 Pod keeps the service awake.
       A saved login opens the offline browser even with no downloaded tracks
 
-Logs go to the card: spot.log, aplay.log. With a file named debug in
+The Q2 has no shell (no adb, telnet or ssh, only a UART on ttyS3), so
+logs go to the card: spot.log, aplay.log. With a file named debug in
 .spotify, load.log gets the load average and librespot's VmRSS every 10 s,
 and Q2 Pod writes q2pod.log (each hand-over step).
 

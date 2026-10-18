@@ -25,7 +25,9 @@ use crate::{
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
     core::{
-        Error, FileId, Session, SpotifyId, SpotifyUri, cache::OfflineTrack, util::SeqGenerator,
+        Error, FileId, Session, SpotifyId, SpotifyUri,
+        cache::{OfflineTrack, unix_ms},
+        util::SeqGenerator,
     },
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
@@ -37,7 +39,6 @@ use futures_util::{
     stream::futures_unordered::FuturesUnordered,
 };
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
@@ -1132,24 +1133,7 @@ impl PlayerTrackLoader {
                 let account = self.session.username();
                 // Without a key the file can't be played offline, so it isn't listed.
                 if !account.is_empty() && key.is_some() {
-                    let (artist, album) = match &audio_item.unique_fields {
-                        UniqueFields::Track { artists, album, .. } => (
-                            artists
-                                .0
-                                .iter()
-                                .map(|a| a.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            album.clone(),
-                        ),
-                        UniqueFields::Episode { show_name, .. } => {
-                            (show_name.clone(), String::new())
-                        }
-                        UniqueFields::Local { artists, album, .. } => (
-                            artists.clone().unwrap_or_default(),
-                            album.clone().unwrap_or_default(),
-                        ),
-                    };
+                    let (artist, album) = audio_item.unique_fields.artist_album();
                     let item = OfflineTrack {
                         account,
                         uri: audio_item.uri.clone(),
@@ -1161,10 +1145,7 @@ impl PlayerTrackLoader {
                         album,
                         duration_ms: audio_item.duration_ms,
                         is_explicit: audio_item.is_explicit,
-                        played_at: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
+                        played_at: unix_ms(),
                     };
                     if let Err(e) = cache.save_offline_track(&item) {
                         warn!("Could not save offline track: {e}");

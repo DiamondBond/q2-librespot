@@ -12,7 +12,11 @@ use hyper::StatusCode;
 use tempfile::NamedTempFile;
 use tokio::sync::{mpsc, oneshot};
 
-use librespot_core::{Error, http_client::HttpClient, session::Session};
+use librespot_core::{
+    Error,
+    http_client::{HttpClient, RATE_LIMIT_MAX_WAIT},
+    session::Session,
+};
 
 use crate::range_set::{Range, RangeSet};
 
@@ -84,7 +88,9 @@ async fn receive_data(
         let code = response.status();
         if code != StatusCode::PARTIAL_CONTENT {
             if code == StatusCode::TOO_MANY_REQUESTS {
-                if let Some(duration) = HttpClient::get_retry_after(response.headers()) {
+                if let Some(duration) = HttpClient::retry_after(response.headers())
+                    .filter(|d| *d <= RATE_LIMIT_MAX_WAIT)
+                {
                     warn!(
                         "Rate limiting, retrying in {} seconds...",
                         duration.as_secs()

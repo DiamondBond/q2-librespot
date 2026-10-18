@@ -136,6 +136,14 @@ impl CountryTopTracks {
     }
 }
 
+impl Artists {
+    /// The artists' names, comma-separated.
+    pub fn names(&self) -> String {
+        let names: Vec<_> = self.iter().map(|a| a.name.as_str()).collect();
+        names.join(", ")
+    }
+}
+
 impl Artist {
     /// Get the full list of albums, not containing duplicate variants of the same albums.
     ///

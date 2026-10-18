@@ -2,7 +2,6 @@ use bytes::Bytes;
 use http::Request;
 use librespot::{
     core::{cache::Cache, http_client::HttpClient},
-    metadata::audio::UniqueFields,
     playback::player::{PlayerEvent, PlayerEventChannel},
 };
 use log::warn;
@@ -56,7 +55,7 @@ fn one_line(s: &str) -> String {
 }
 
 /// Writes path whole, through a temporary file and a rename, so a reader never sees half of it.
-fn write_atomic(path: &Path, data: &[u8]) {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     if let Err(e) = fs::write(&tmp, data).and_then(|_| fs::rename(&tmp, path)) {
@@ -134,21 +133,7 @@ pub fn run(
                     s.track = audio_item.track_id.to_id().unwrap_or_default();
                     s.title = one_line(&audio_item.name);
                     s.duration_ms = audio_item.duration_ms;
-                    (s.artist, s.album) = match audio_item.unique_fields {
-                        UniqueFields::Track { artists, album, .. } => (
-                            artists
-                                .0
-                                .iter()
-                                .map(|a| a.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            album,
-                        ),
-                        UniqueFields::Local { artists, album, .. } => {
-                            (artists.unwrap_or_default(), album.unwrap_or_default())
-                        }
-                        UniqueFields::Episode { show_name, .. } => (show_name, String::new()),
-                    };
+                    (s.artist, s.album) = audio_item.unique_fields.artist_album();
                     s.artist = one_line(&s.artist);
                     s.album = one_line(&s.album);
                     s.cover = false;

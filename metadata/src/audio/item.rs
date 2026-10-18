@@ -67,6 +67,23 @@ pub enum UniqueFields {
     },
 }
 
+impl UniqueFields {
+    /// The artists (or show) and album, as displayed.
+    pub fn artist_album(&self) -> (String, String) {
+        match self {
+            Self::Track { artists, album, .. } => {
+                let names: Vec<_> = artists.iter().map(|a| a.name.as_str()).collect();
+                (names.join(", "), album.clone())
+            }
+            Self::Local { artists, album, .. } => (
+                artists.clone().unwrap_or_default(),
+                album.clone().unwrap_or_default(),
+            ),
+            Self::Episode { show_name, .. } => (show_name.clone(), String::new()),
+        }
+    }
+}
+
 impl AudioItem {
     pub async fn get_file(session: &Session, uri: SpotifyUri) -> AudioItemResult {
         let image_url = session
