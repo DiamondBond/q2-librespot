@@ -498,7 +498,8 @@ impl Cache {
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
         };
-        let mut tracks = Vec::new();
+        let mut complete = Vec::new();
+        let mut pruned = Vec::new();
         let now = unix_ms();
         for entry in entries.flatten() {
             if !entry.file_type().is_ok_and(|t| t.is_file()) {
@@ -513,23 +514,58 @@ impl Cache {
             if track.account != account || track.account.is_empty() {
                 continue;
             }
+            // Only the record named for its file: <hex>.tmp is a save not yet renamed, or cut off.
+            if FileId(track.file).to_base16().ok().as_deref() != entry.file_name().to_str() {
+                continue;
+            }
             let Some(path) = self.file_path(FileId(track.file)) else {
                 continue;
             };
-            if path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
-                tracks.push(track);
+            let size = path
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map_or(0, |m| m.len());
+            if size > 0 {
+                complete.push((track, size, entry.path()));
             } else if now.saturating_sub(track.played_at) > 86_400_000 {
                 // Evicted audio: its record and art go too, so they stay within the audio's count.
                 // A day's grace, so a download still running keeps the key it will need.
                 let _ = fs::remove_file(entry.path());
-                if let Some(art) = track
-                    .uri
-                    .rsplit(':')
-                    .next()
-                    .and_then(|id| self.offline_cover_path(id))
-                {
-                    let _ = fs::remove_file(art);
+                pruned.push(track.uri);
+            }
+        }
+        // Two complete copies of one track (one saved at 160 kbit/s, then again at 320): the
+        // larger file, the higher bitrate, is kept, and the other's record and audio go.
+        complete.sort_by(|a, b| {
+            a.0.uri
+                .cmp(&b.0.uri)
+                .then(b.1.cmp(&a.1))
+                .then(b.0.played_at.cmp(&a.0.played_at))
+        });
+        let mut tracks: Vec<OfflineTrack> = Vec::with_capacity(complete.len());
+        for (track, _, record) in complete {
+            match tracks.last() {
+                Some(kept) if kept.uri == track.uri => {
+                    let _ = fs::remove_file(record);
+                    if kept.file != track.file {
+                        let _ = self.remove_file(FileId(track.file));
+                    }
                 }
+                _ => tracks.push(track),
+            }
+        }
+        // A pruned record's art goes unless another copy of the track still shows it.
+        for uri in pruned {
+            if tracks.iter().any(|kept| kept.uri == uri) {
+                continue;
+            }
+            if let Some(art) = uri
+                .rsplit(':')
+                .next()
+                .and_then(|id| self.offline_cover_path(id))
+            {
+                let _ = fs::remove_file(art);
             }
         }
         tracks.sort_by(|a, b| b.played_at.cmp(&a.played_at));
@@ -743,6 +779,76 @@ mod test {
         recovered.clear_offline().unwrap();
         assert!(recovered.offline_tracks("alice").is_empty());
         assert!(recovered.offline_cover("abcdefghijklmnopqrstuv").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_complete_higher_bitrate_copy_replaces_the_lower_one() {
+        let root = std::env::temp_dir().join(format!("q2-cache-upgrade-{}", std::process::id()));
+        let audio = root.join("files");
+        let cache = Cache::new(Some(&root), Some(&root), Some(&audio), Some(1000)).unwrap();
+        let uri = "spotify:track:0000000000000000000001";
+        let record = |n: u8, format, played_at| OfflineTrack {
+            account: "alice".into(),
+            uri: uri.into(),
+            file: [n; 20],
+            format,
+            key: Some([n; 16]),
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 1000,
+            is_explicit: false,
+            played_at,
+        };
+        let record_path = |t: &OfflineTrack| {
+            root.join("offline")
+                .join(FileId(t.file).to_base16().unwrap())
+        };
+        let now = unix_ms();
+        let low = record(1, 1, now - 1000); // OGG_VORBIS_160
+        cache.save_offline_track(&low).unwrap();
+        cache
+            .save_file(FileId(low.file), &mut &b"0123456789"[..])
+            .unwrap();
+        // Streaming at 320 kbit/s saves its record first: the 160 copy stays until it completes.
+        let high = record(2, 2, now); // OGG_VORBIS_320
+        cache.save_offline_track(&high).unwrap();
+        let listed = cache.offline_tracks("alice");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file, low.file);
+        cache
+            .save_file(FileId(high.file), &mut &b"0123456789abcdefghij"[..])
+            .unwrap();
+        let listed = cache.offline_tracks("alice");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file, high.file);
+        assert!(!record_path(&low).exists());
+        assert!(cache.file(FileId(low.file)).is_none());
+        assert!(record_path(&high).exists());
+        // Replaying it refreshes the kept record only.
+        cache
+            .save_offline_track(&OfflineTrack {
+                played_at: now + 1,
+                ..high.clone()
+            })
+            .unwrap();
+        assert_eq!(cache.offline_tracks("alice").len(), 1);
+        // A save cut off before its rename (<hex>.tmp) is not a second copy of the same audio.
+        let unfinished = record_path(&high).with_extension("tmp");
+        fs::write(&unfinished, serde_json::to_vec(&high).unwrap()).unwrap();
+        assert_eq!(cache.offline_tracks("alice").len(), 1);
+        assert!(cache.file(FileId(high.file)).is_some());
+        assert!(record_path(&high).exists() && unfinished.exists());
+        // Pruning a copy that never completed keeps the art the listed copy shows.
+        cache
+            .save_offline_cover("0000000000000000000001", b"jpeg")
+            .unwrap();
+        let skipped = record(3, 2, now - 2 * 86_400_000);
+        cache.save_offline_track(&skipped).unwrap();
+        assert_eq!(cache.offline_tracks("alice").len(), 1);
+        assert!(!record_path(&skipped).exists());
+        assert!(cache.offline_cover("0000000000000000000001").is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

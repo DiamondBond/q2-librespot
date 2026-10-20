@@ -28,6 +28,8 @@ pub struct SessionConfig {
     pub proxy: Option<Url>,
     pub ap_port: Option<u16>,
     pub tmp_dir: PathBuf,
+    /// Where a download goes when `tmp_dir`, a tmpfs, has no room for it or RAM is short.
+    pub tmp_fallback_dir: Option<PathBuf>,
     pub autoplay: Option<bool>,
 }
 
@@ -47,6 +49,7 @@ impl SessionConfig {
             proxy: None,
             ap_port: None,
             tmp_dir: std::env::temp_dir(),
+            tmp_fallback_dir: None,
             autoplay: None,
         }
     }

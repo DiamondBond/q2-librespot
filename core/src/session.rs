@@ -645,6 +645,11 @@ impl Session {
     pub fn is_invalid(&self) -> bool {
         self.0.data.read().expect(SESSION_DATA_POISON_MSG).invalid
     }
+
+    /// Connected to an access point and not shut down since: what `send_packet` needs.
+    pub fn is_connected(&self) -> bool {
+        self.0.tx_connection.get().is_some() && !self.is_invalid()
+    }
 }
 
 #[derive(Clone)]

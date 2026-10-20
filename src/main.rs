@@ -285,6 +285,7 @@ async fn get_setup() -> Setup {
     const STATUS_FILE: &str = "status-file";
     const SYSTEM_CACHE: &str = "system-cache";
     const TEMP_DIR: &str = "tmp";
+    const TEMP_FALLBACK_DIR: &str = "tmp-fallback";
     const USERNAME: &str = "username";
     const VERBOSE: &str = "verbose";
     const VERSION: &str = "version";
@@ -351,6 +352,7 @@ async fn get_setup() -> Setup {
     const BROWSE_SOCKET_SHORT: &str = ""; // no short flag
     const CONTROL_SOCKET_SHORT: &str = ""; // no short flag
     const STATUS_FILE_SHORT: &str = ""; // no short flag
+    const TEMP_FALLBACK_DIR_SHORT: &str = ""; // no short flag
 
     // Options that have different descriptions
     // depending on what backends were enabled at build time.
@@ -489,6 +491,12 @@ async fn get_setup() -> Setup {
         TEMP_DIR_SHORT,
         TEMP_DIR,
         "Path to a directory where files will be temporarily stored while downloading.",
+        "PATH",
+    )
+    .optopt(
+        TEMP_FALLBACK_DIR_SHORT,
+        TEMP_FALLBACK_DIR,
+        "Path to a directory for downloads that do not fit in the tmp directory (a tmpfs) or RAM.",
         "PATH",
     )
     .optopt(
@@ -1162,6 +1170,15 @@ async fn get_setup() -> Setup {
         tmp_dir
     });
 
+    let tmp_fallback_dir = opt_str(TEMP_FALLBACK_DIR).map(|p| {
+        let dir = PathBuf::from(p);
+        if let Err(e) = create_dir_all(&dir) {
+            error!("could not create or access specified tmp fallback directory: {e}");
+            exit(1);
+        }
+        dir
+    });
+
     let enable_oauth = opt_present(ENABLE_OAUTH);
 
     let cache = {
@@ -1595,6 +1612,7 @@ async fn get_setup() -> Setup {
             }
         }),
 		tmp_dir,
+		tmp_fallback_dir,
 		autoplay,
 		..SessionConfig::default()
     };
@@ -2033,7 +2051,11 @@ async fn main() {
     let player = Player::new(player_config, session.clone(), soft_volume, move || {
         (backend)(device, format)
     });
-    let offline = q2browse::OfflinePlayback::new(setup.cache.clone(), player.clone());
+    let offline = q2browse::OfflinePlayback::new(
+        setup.cache.clone(),
+        player.clone(),
+        setup.player_config.bitrate,
+    );
 
     if let Some(player_event_program) = setup.player_event_program.clone() {
         _event_handler = Some(EventHandler::new(

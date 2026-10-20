@@ -75,6 +75,22 @@ handoff saves it).
 
 librespot is started with:
 
+  -b 320
+      320 kbit/s Ogg Vorbis, or 96 or 160 when .spotify/.quality says so
+      (its digits, read at each start). Playlist downloads take the same
+      rate. A track saved at a lower rate is fetched again when played or
+      downloaded online, and the new copy replaces the old once complete;
+      offline, or when that fails or does not start within 8 s, the saved
+      copy plays. At 320 the cache holds half the hours it does at 160
+      (2G, the default, about 14 hours): raise Streaming > Configuration's
+      cache, or put 160 in .quality
+  --tmp /tmp/q2-librespot.tmp --tmp-fallback ./tmp
+      this branch: each download's space is reserved in /tmp, a tmpfs of
+      half the RAM, and one that does not fit, or would leave less than
+      24 MiB of RAM, goes to .spotify/tmp on the card instead (on a 128 MB
+      unit, anything longer than about 50 minutes at 160 kbit/s, or 25 at
+      320). The card has no sparse files, so such a file is written whole
+      before it plays, which delays its start. run empties both at each start
   --backend subprocess --device "/bin/sh ./aplay.sh"
       aplay runs only while librespot plays, so the PCM is free for local
       music whenever it is paused (hciplayer takes one client per PCM)
@@ -99,8 +115,9 @@ librespot is started with:
       and saved track metadata, keys and artwork allow offline replay.
       Sign out deletes the login, cached audio, keys and artwork.
       Q2SPOT/1 download <playlist-uri> starts one background playlist download;
-      downloadstatus returns its progress in the response message. Existing
-      complete tracks are reused. The normal cache cap still applies, so a
+      downloadstatus returns its progress in the response message. Complete
+      tracks at the -b rate or better are reused; lower ones are fetched
+      again, and kept when that fails. The normal cache cap still applies, so a
       playlist larger than the cap can evict its earlier tracks.
       /tmp/q2-librespot.download reports downloading=1 while the job runs,
       independently of playback, so Q2 Pod keeps the service awake.
@@ -108,8 +125,9 @@ librespot is started with:
 
 The Q2 has no shell (no adb, telnet or ssh, only a UART on ttyS3), so
 logs go to the card: spot.log, aplay.log. With a file named debug in
-.spotify, load.log gets the load average and librespot's VmRSS every 10 s,
-and Q2 Pod writes q2pod.log (each hand-over step).
+.spotify, load.log gets the load average, librespot's VmRSS and the RAM's
+MemAvailable and Shmem (tmpfs) every 10 s, and Q2 Pod writes q2pod.log
+(each hand-over step).
 
 Power the Q2 off before taking the card out or putting it in: swapping it
 while the Q2 was on or asleep corrupted the FAT twice.
