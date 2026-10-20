@@ -155,7 +155,15 @@ impl OfflinePlayback {
             }
             PlayerEvent::EndOfTrack {
                 play_request_id, ..
-            } if queue.id == Some(play_request_id) => self.step(queue, true),
+            } if queue.id == Some(play_request_id) => {
+                // At the list's end, stop as Spirc does at a context's end: otherwise the state
+                // stays "playing" and the sink keeps the audio device.
+                let more = self.step(queue, true);
+                if !more {
+                    self.player.stop();
+                }
+                more
+            }
             _ => true,
         };
         if !keep {
