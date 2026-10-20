@@ -106,8 +106,9 @@ librespot is started with:
       and saved track metadata, keys and artwork allow offline replay.
       Sign out deletes the login, cached audio, keys and artwork.
       Q2SPOT/1 download <playlist-uri> starts one background playlist download;
-      downloadstatus returns its progress in the response message. Existing
-      complete tracks are reused. The normal cache cap still applies, so a
+      downloadstatus returns its progress in the response message. Complete
+      tracks at the -b rate or better are reused; lower ones are fetched
+      again, and kept when that fails. The normal cache cap still applies, so a
       playlist larger than the cap can evict its earlier tracks.
       /tmp/q2-librespot.download reports downloading=1 while the job runs,
       independently of playback, so Q2 Pod keeps the service awake.

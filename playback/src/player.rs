@@ -900,6 +900,77 @@ impl PlayerState {
     }
 }
 
+/// How long a saved track waits for a better copy to start streaming before the saved one plays
+/// (Q2 Pod gives a downloaded track 15 s to start).
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The formats a track is streamed in for `bitrate`, in order of preference.
+pub fn preferred_formats(bitrate: Bitrate) -> [AudioFileFormat; 7] {
+    // (Most) podcasts seem to support only 96 kbps Ogg Vorbis, so fall back to it
+    match bitrate {
+        Bitrate::Bitrate96 => [
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+        ],
+        Bitrate::Bitrate160 => [
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+        ],
+        Bitrate::Bitrate320 => [
+            AudioFileFormat::OGG_VORBIS_320,
+            AudioFileFormat::MP3_320,
+            AudioFileFormat::MP3_256,
+            AudioFileFormat::OGG_VORBIS_160,
+            AudioFileFormat::MP3_160,
+            AudioFileFormat::OGG_VORBIS_96,
+            AudioFileFormat::MP3_96,
+        ],
+    }
+}
+
+/// Bytes per second of `format`.
+pub fn stream_data_rate(format: AudioFileFormat) -> usize {
+    let kbps = match format {
+        AudioFileFormat::OGG_VORBIS_96 => 12.,
+        AudioFileFormat::OGG_VORBIS_160 => 20.,
+        AudioFileFormat::OGG_VORBIS_320 => 40.,
+        AudioFileFormat::MP3_256 => 32.,
+        AudioFileFormat::MP3_320 => 40.,
+        AudioFileFormat::MP3_160 => 20.,
+        AudioFileFormat::MP3_96 => 12.,
+        AudioFileFormat::MP3_160_ENC => 20.,
+        AudioFileFormat::AAC_24 => 3.,
+        AudioFileFormat::AAC_48 => 6.,
+        AudioFileFormat::AAC_160 => 20.,
+        AudioFileFormat::AAC_320 => 40.,
+        AudioFileFormat::MP4_128 => 16.,
+        AudioFileFormat::OTHER5 => 40.,
+        AudioFileFormat::FLAC_FLAC => 112., // assume 900 kbit/s on average
+        AudioFileFormat::XHE_AAC_12 => 1.5,
+        AudioFileFormat::XHE_AAC_16 => 2.,
+        AudioFileFormat::XHE_AAC_24 => 3.,
+        AudioFileFormat::FLAC_FLAC_24BIT => 3.,
+    };
+    let data_rate: f32 = kbps * 1024.;
+    data_rate.ceil() as usize
+}
+
+/// Whether a saved copy in `format` is as good as `bitrate` asks for: at least the data rate of
+/// its first choice, so a 320 kbit/s copy serves 160 and a 160 one does not serve 320.
+pub fn serves_bitrate(format: AudioFileFormat, bitrate: Bitrate) -> bool {
+    stream_data_rate(format) >= stream_data_rate(preferred_formats(bitrate)[0])
+}
+
 struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
@@ -932,32 +1003,6 @@ impl PlayerTrackLoader {
         }
     }
 
-    fn stream_data_rate(&self, format: AudioFileFormat) -> Option<usize> {
-        let kbps = match format {
-            AudioFileFormat::OGG_VORBIS_96 => 12.,
-            AudioFileFormat::OGG_VORBIS_160 => 20.,
-            AudioFileFormat::OGG_VORBIS_320 => 40.,
-            AudioFileFormat::MP3_256 => 32.,
-            AudioFileFormat::MP3_320 => 40.,
-            AudioFileFormat::MP3_160 => 20.,
-            AudioFileFormat::MP3_96 => 12.,
-            AudioFileFormat::MP3_160_ENC => 20.,
-            AudioFileFormat::AAC_24 => 3.,
-            AudioFileFormat::AAC_48 => 6.,
-            AudioFileFormat::AAC_160 => 20.,
-            AudioFileFormat::AAC_320 => 40.,
-            AudioFileFormat::MP4_128 => 16.,
-            AudioFileFormat::OTHER5 => 40.,
-            AudioFileFormat::FLAC_FLAC => 112., // assume 900 kbit/s on average
-            AudioFileFormat::XHE_AAC_12 => 1.5,
-            AudioFileFormat::XHE_AAC_16 => 2.,
-            AudioFileFormat::XHE_AAC_24 => 3.,
-            AudioFileFormat::FLAC_FLAC_24BIT => 3.,
-        };
-        let data_rate: f32 = kbps * 1024.;
-        Some(data_rate.ceil() as usize)
-    }
-
     async fn load_track(
         &self,
         track_uri: SpotifyUri,
@@ -980,6 +1025,36 @@ impl PlayerTrackLoader {
         track_uri: SpotifyUri,
         position_ms: u32,
     ) -> Option<PlayerLoadedTrackData> {
+        let saved = self.session.cache().and_then(|cache| {
+            cache
+                .offline_tracks(&self.session.username())
+                .into_iter()
+                .find(|item| item.uri == track_uri.to_uri().unwrap_or_default())
+        });
+        // A saved copy plays offline, and online when it is as good as the bitrate asks for. A
+        // lower one is streamed again (that copy replaces it once complete), and plays when
+        // streaming fails or does not start within UPGRADE_TIMEOUT.
+        if let Some(item) = saved.as_ref().filter(|item| {
+            self.session.is_connected()
+                && !AudioFileFormat::try_from(item.format)
+                    .is_ok_and(|format| serves_bitrate(format, self.config.bitrate))
+        }) {
+            let streamed = self.load_remote_item(track_uri.clone(), position_ms, None);
+            match tokio::time::timeout(UPGRADE_TIMEOUT, streamed).await {
+                Ok(Some(data)) => return Some(data),
+                Ok(None) => warn!("Playing the saved copy of <{}>", item.uri),
+                Err(_) => warn!("Streaming <{}> timed out, playing the saved copy", item.uri),
+            }
+        }
+        self.load_remote_item(track_uri, position_ms, saved).await
+    }
+
+    async fn load_remote_item(
+        &self,
+        track_uri: SpotifyUri,
+        position_ms: u32,
+        saved: Option<OfflineTrack>,
+    ) -> Option<PlayerLoadedTrackData> {
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
             Err(_) => {
@@ -988,12 +1063,6 @@ impl PlayerTrackLoader {
             }
         };
 
-        let saved = self.session.cache().and_then(|cache| {
-            cache
-                .offline_tracks(&self.session.username())
-                .into_iter()
-                .find(|item| item.uri == track_uri.to_uri().unwrap_or_default())
-        });
         let audio_item = if let Some(item) = saved.as_ref() {
             let mut files = AudioFiles::default();
             files.insert(
@@ -1044,36 +1113,7 @@ impl PlayerTrackLoader {
             audio_item.name, audio_item.uri
         );
 
-        // (Most) podcasts seem to support only 96 kbps Ogg Vorbis, so fall back to it
-        let formats = match self.config.bitrate {
-            Bitrate::Bitrate96 => [
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-            ],
-            Bitrate::Bitrate160 => [
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-            ],
-            Bitrate::Bitrate320 => [
-                AudioFileFormat::OGG_VORBIS_320,
-                AudioFileFormat::MP3_320,
-                AudioFileFormat::MP3_256,
-                AudioFileFormat::OGG_VORBIS_160,
-                AudioFileFormat::MP3_160,
-                AudioFileFormat::OGG_VORBIS_96,
-                AudioFileFormat::MP3_96,
-            ],
-        };
+        let formats = preferred_formats(self.config.bitrate);
 
         let (format, file_id) =
             match formats
@@ -1092,7 +1132,7 @@ impl PlayerTrackLoader {
                 }
             };
 
-        let bytes_per_second = self.stream_data_rate(format)?;
+        let bytes_per_second = stream_data_rate(format);
 
         // This is only a loop to be able to reload the file if an error occurred
         // while opening a cached file.

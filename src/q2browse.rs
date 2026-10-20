@@ -16,7 +16,10 @@ use librespot::{
         Album, Artist, Metadata, Track,
         audio::{AudioFileFormat, AudioItem, UniqueFields},
     },
-    playback::player::{Player, PlayerEvent},
+    playback::{
+        config::Bitrate,
+        player::{Player, PlayerEvent, preferred_formats, serves_bitrate, stream_data_rate},
+    },
     protocol::{
         collection2v2::{CollectionItem, PageResponse},
         extended_metadata::{
@@ -92,6 +95,8 @@ const OPS: [(&str, usize, usize, bool); 22] = [
 pub struct OfflinePlayback {
     cache: Option<Cache>,
     player: Arc<Player>,
+    /// Downloads prefer this rate, as playback does.
+    bitrate: Bitrate,
     current: Mutex<Option<OfflineQueue>>,
     download: Mutex<Download>,
 }
@@ -120,10 +125,11 @@ struct OfflineQueue {
 }
 
 impl OfflinePlayback {
-    pub fn new(cache: Option<Cache>, player: Arc<Player>) -> Arc<Self> {
+    pub fn new(cache: Option<Cache>, player: Arc<Player>, bitrate: Bitrate) -> Arc<Self> {
         let this = Arc::new(Self {
             cache,
             player: player.clone(),
+            bitrate,
             current: Mutex::new(None),
             download: Mutex::new(Download {
                 task: None,
@@ -325,12 +331,10 @@ impl OfflinePlayback {
                     .await
                     .map_err(|_| fail(Status::Offline))??;
                 for row in page.rows {
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(180),
-                        download_track(&session, &row.uri),
-                    )
-                    .await;
-                    if matches!(result, Ok(Ok(()))) {
+                    if download_track(&session, &row.uri, self.bitrate)
+                        .await
+                        .is_ok()
+                    {
                         saved += 1;
                     } else {
                         failed += 1;
@@ -374,32 +378,71 @@ impl OfflinePlayback {
     }
 }
 
-/// Downloads encrypted audio into the existing bounded cache without loading the player.
-async fn download_track(session: &Session, uri: &str) -> Result<(), Fail> {
-    let cache = session.cache().ok_or_else(|| fail(Status::Unavailable))?;
-    if cache
-        .offline_tracks(&session.username())
-        .iter()
-        .any(|track| track.uri == uri)
-    {
-        return Ok(());
+/// The Ogg Vorbis formats a download tries for `bitrate`, in playback's order; with a saved copy
+/// only better ones, and none when the copy is as good as the bitrate asks for.
+fn download_formats(bitrate: Bitrate, saved: Option<AudioFileFormat>) -> Vec<AudioFileFormat> {
+    use AudioFileFormat::{OGG_VORBIS_96, OGG_VORBIS_160, OGG_VORBIS_320};
+    if saved.is_some_and(|saved| serves_bitrate(saved, bitrate)) {
+        return Vec::new();
     }
+    preferred_formats(bitrate)
+        .into_iter()
+        .filter(|format| matches!(format, OGG_VORBIS_96 | OGG_VORBIS_160 | OGG_VORBIS_320))
+        .filter(|&format| {
+            saved.is_none_or(|saved| stream_data_rate(format) > stream_data_rate(saved))
+        })
+        .collect()
+}
+
+/// Downloads encrypted audio into the existing bounded cache without loading the player. A track
+/// saved at a lower rate than `bitrate` is downloaded again, and the new copy replaces it; the
+/// saved copy still counts as downloaded when that fails.
+async fn download_track(session: &Session, uri: &str, bitrate: Bitrate) -> Result<(), Fail> {
+    let cache = session.cache().ok_or_else(|| fail(Status::Unavailable))?;
+    let saved = cache
+        .offline_tracks(&session.username())
+        .into_iter()
+        .find(|track| track.uri == uri)
+        .and_then(|track| AudioFileFormat::try_from(track.format).ok());
+    let formats = download_formats(bitrate, saved);
+    let Some(&first) = formats.first() else {
+        return Ok(());
+    };
+    // 180 s a track, and 360 s at 320 kbit/s, whose files are twice as large.
+    let deadline = Duration::from_secs(match first {
+        AudioFileFormat::OGG_VORBIS_320 => 360,
+        _ => 180,
+    });
+    let fetched = tokio::time::timeout(deadline, fetch_track(session, cache, uri, formats))
+        .await
+        .unwrap_or_else(|_| Err(fail(Status::Offline)));
+    match fetched {
+        Err(e) if saved.is_some() => {
+            warn!("Kept the saved copy of {uri}: {}", e.1);
+            Ok(())
+        }
+        fetched => fetched,
+    }
+}
+
+async fn fetch_track(
+    session: &Session,
+    cache: &Cache,
+    uri: &str,
+    formats: Vec<AudioFileFormat>,
+) -> Result<(), Fail> {
     let track_uri = SpotifyUri::from_uri(uri).map_err(|_| fail(Status::Bad))?;
     let track_id = (&track_uri).try_into().map_err(|_| fail(Status::Bad))?;
     let item = AudioItem::get_file(session, track_uri).await?;
     if item.availability.is_err() {
         return Err(fail(Status::Unavailable));
     }
-    let ((format, file), rate) = [
-        (AudioFileFormat::OGG_VORBIS_160, 20 * 1024),
-        (AudioFileFormat::OGG_VORBIS_96, 12 * 1024),
-        (AudioFileFormat::OGG_VORBIS_320, 40 * 1024),
-    ]
-    .into_iter()
-    .find_map(|(format, rate)| item.files.get(&format).map(|file| ((format, *file), rate)))
-    .ok_or_else(|| fail(Status::Unavailable))?;
+    let (format, file) = formats
+        .into_iter()
+        .find_map(|format| item.files.get(&format).map(|file| (format, *file)))
+        .ok_or_else(|| fail(Status::Unavailable))?;
     let key = session.audio_key().request(track_id, file).await?;
-    let audio = AudioFile::open(session, file, rate).await?;
+    let audio = AudioFile::open(session, file, stream_data_rate(format)).await?;
     let controller = audio.get_stream_loader_controller()?;
     // Closing on cancellation also stops its network fetch before sign-out clears the cache.
     struct Close(librespot::audio::StreamLoaderController);
@@ -1575,9 +1618,47 @@ mod tests {
                 &mut &b"complete audio"[..],
             )
             .unwrap();
-        download_track(&session, &record.uri).await.unwrap();
+        // 160 kbit/s serves 160 and 96: neither asks the network.
+        download_track(&session, &record.uri, Bitrate::Bitrate160)
+            .await
+            .unwrap();
+        download_track(&session, &record.uri, Bitrate::Bitrate96)
+            .await
+            .unwrap();
+        // 320 asks for a better copy, which fails here without a connection: the saved one counts.
+        download_track(&session, &record.uri, Bitrate::Bitrate320)
+            .await
+            .unwrap();
         assert_eq!(cache.offline_tracks("alice").len(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn downloads_follow_the_bitrate_and_upgrade_lower_copies() {
+        use AudioFileFormat::{
+            OGG_VORBIS_96 as V96, OGG_VORBIS_160 as V160, OGG_VORBIS_320 as V320,
+        };
+        use Bitrate::{Bitrate96 as B96, Bitrate160 as B160, Bitrate320 as B320};
+        assert_eq!(download_formats(B320, None), [V320, V160, V96]);
+        assert_eq!(download_formats(B160, None), [V160, V96, V320]);
+        assert_eq!(download_formats(B96, None), [V96, V160, V320]);
+        let rates: Vec<_> = [V96, V160, V320].map(stream_data_rate).into();
+        assert_eq!(rates, [12 * 1024, 20 * 1024, 40 * 1024]);
+        // A lower copy is fetched again in a better format only; one as good is kept.
+        assert_eq!(download_formats(B320, Some(V160)), [V320]);
+        assert_eq!(download_formats(B320, Some(V96)), [V320, V160]);
+        assert_eq!(download_formats(B160, Some(V96)), [V160, V320]);
+        assert!(download_formats(B320, Some(V320)).is_empty());
+        assert!(download_formats(B160, Some(V320)).is_empty());
+        assert!(download_formats(B96, Some(V160)).is_empty());
+        assert!(download_formats(B320, Some(AudioFileFormat::MP3_320)).is_empty());
+        assert_eq!(
+            download_formats(B320, Some(AudioFileFormat::MP3_256)),
+            [V320]
+        );
+        // Playback keeps a saved copy online by the same rule.
+        assert!(serves_bitrate(V320, B160));
+        assert!(!serves_bitrate(V160, B320));
     }
 
     #[tokio::test]
@@ -1620,7 +1701,7 @@ mod tests {
                 )
             },
         );
-        let offline = OfflinePlayback::new(Some(cache), player);
+        let offline = OfflinePlayback::new(Some(cache), player, Bitrate::Bitrate320);
         *offline.current.lock().unwrap() = Some(OfflineQueue {
             uris: uris.clone(),
             at: 0,
@@ -1660,7 +1741,7 @@ mod tests {
                 )
             },
         );
-        let offline = OfflinePlayback::new(None, player);
+        let offline = OfflinePlayback::new(None, player, Bitrate::Bitrate320);
         download_state(true, "Starting");
         // Exercise the real job's failure cleanup without a Spotify/network dependency.
         offline
@@ -1707,7 +1788,7 @@ mod tests {
                 )
             },
         );
-        let offline = OfflinePlayback::new(None, player);
+        let offline = OfflinePlayback::new(None, player, Bitrate::Bitrate320);
         let (_tx, mut link) = watch::channel(Link::Login);
         let (signout, _rx) = mpsc::unbounded_channel();
         let mut flushed = None;

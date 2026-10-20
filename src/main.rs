@@ -2048,7 +2048,11 @@ async fn main() {
     let player = Player::new(player_config, session.clone(), soft_volume, move || {
         (backend)(device, format)
     });
-    let offline = q2browse::OfflinePlayback::new(setup.cache.clone(), player.clone());
+    let offline = q2browse::OfflinePlayback::new(
+        setup.cache.clone(),
+        player.clone(),
+        setup.player_config.bitrate,
+    );
 
     if let Some(player_event_program) = setup.player_event_program.clone() {
         _event_handler = Some(EventHandler::new(
