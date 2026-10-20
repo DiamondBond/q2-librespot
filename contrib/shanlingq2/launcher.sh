@@ -15,7 +15,7 @@ while :; do
     start=$(date +%s)
     limit=$(cat .cache-size 2>/dev/null)
     case $limit in '' | [!0-9]* | *[!0-9KMG]* | *[KMG]?*) limit=2G ;; esac
-    q=$(tr -cd 0-9 < .quality 2>/dev/null)
+    q=$(cat .quality 2>/dev/null)
     case $q in 96 | 160 | 320) ;; *) q=320 ;; esac
     rm -rf /tmp/q2-librespot.tmp ./tmp
     ./librespot -n Q2 -b "$q" --cache ./cache --cache-size-limit "$limit" \
@@ -26,6 +26,7 @@ while :; do
         --browse-socket /tmp/q2-librespot.browse.sock 2>> ./spot.log
     echo "exit $? $(date)" >> ./spot.log
     if [ $(($(date +%s) - start)) -gt 60 ]; then wait=5; elif [ $wait -lt 60 ]; then wait=$((wait * 2)); fi
+    [ $wait -le 60 ] || wait=60
     sleep $wait
 done > /dev/null 2>&1 &
 echo $! > /tmp/q2-librespot # the loop, which Q2 Pod's Rockbox shortcut kills
