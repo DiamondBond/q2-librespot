@@ -4,6 +4,7 @@ use std::{
     cmp::min,
     fs,
     io::{self, Read, Seek, SeekFrom},
+    path::Path,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -523,8 +524,22 @@ impl AudioFileStreaming {
             throughput: AtomicUsize::new(0),
         });
 
-        let write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
-        write_file.as_file().set_len(file_size as u64)?;
+        let write_file = match session.config().tmp_fallback_dir.clone() {
+            Some(fallback) => {
+                let tmp_dir = session.config().tmp_dir.clone();
+                let size = file_size as u64;
+                tokio::task::spawn_blocking(move || {
+                    temp_file(&tmp_dir, &fallback, size, mem_available())
+                })
+                .await
+                .map_err(Error::internal)??
+            }
+            None => {
+                let write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
+                write_file.as_file().set_len(file_size as u64)?;
+                write_file
+            }
+        };
 
         let read_file = write_file.reopen()?;
 
@@ -547,6 +562,97 @@ impl AudioFileStreaming {
             shared,
         })
     }
+}
+
+/// RAM a tmpfs download must leave: without swap its pages cannot be reclaimed, and when RAM runs
+/// out the kernel kills a process rather than report the tmpfs (half the RAM) full.
+const RAM_RESERVE: u64 = 24 << 20;
+
+/// The download's temporary file in `tmp_dir`, a tmpfs, with its space reserved there, so a full
+/// one fails here rather than at a later write (a sparse `set_len` always succeeds, and two files
+/// opened together could both seem to fit). One that does not fit, or would leave less than
+/// `RAM_RESERVE` of the `ram` available, goes to `fallback`, sized there too: on a FAT card, which
+/// has no sparse files, that writes it whole, as the decoder's first read near its end would
+/// anyway, and this runs in a blocking task before playback waits on the file.
+fn temp_file(
+    tmp_dir: &Path,
+    fallback: &Path,
+    file_size: u64,
+    ram: Option<u64>,
+) -> io::Result<NamedTempFile> {
+    let mut file = NamedTempFile::new_in(tmp_dir)?;
+    let reserved = match ram {
+        Some(ram) if ram < file_size.saturating_add(RAM_RESERVE) => Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{} MiB of RAM available", ram >> 20),
+        )),
+        _ => reserve(file.as_file(), file_size),
+    };
+    match reserved {
+        Ok(()) => return Ok(file),
+        Err(e) if needs_fallback(&e) => {
+            file = NamedTempFile::new_in(fallback)?;
+            info!(
+                "Downloading {file_size} bytes to {} instead of {}: {e}",
+                file.path().display(),
+                tmp_dir.display()
+            );
+        }
+        Err(_) => {} // cannot reserve there: sized as without a fallback
+    }
+    file.as_file().set_len(file_size)?;
+    Ok(file)
+}
+
+/// Whether a file whose space could not be reserved belongs in the fallback dir: its file system
+/// is full (ENOSPC), cannot hold a file that large (EFBIG) or is out of RAM (ENOMEM).
+fn needs_fallback(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::FileTooLarge | io::ErrorKind::OutOfMemory
+    )
+}
+
+/// Allocates the file's `len` bytes now: fallocate fails where the file system cannot allocate
+/// ahead, where glibc's posix_fallocate would write the whole file instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reserve(file: &fs::File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let len =
+        libc::off_t::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
+    let allocate = || {
+        // SAFETY: the descriptor is open for as long as `file` is borrowed.
+        match unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    };
+    // A signal during a large allocation interrupts it (EINTR), undone: once more.
+    match allocate() {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => allocate(),
+        reserved => reserved,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn reserve(file: &fs::File, len: u64) -> io::Result<()> {
+    file.set_len(len)
+}
+
+/// The RAM the kernel can still give (MemAvailable).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn mem_available() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let kib: u64 = kib.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some(kib << 10)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn mem_available() -> Option<u64> {
+    None
 }
 
 impl Read for AudioFileStreaming {
@@ -685,5 +791,52 @@ impl Seek for AudioFile {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_full_file_system_or_ram_falls_back() {
+        use io::ErrorKind::*;
+        for kind in [StorageFull, FileTooLarge, OutOfMemory] {
+            assert!(needs_fallback(&kind.into()));
+        }
+        for kind in [Interrupted, PermissionDenied, Unsupported] {
+            assert!(!needs_fallback(&kind.into()));
+        }
+        #[cfg(target_os = "linux")]
+        for (errno, falls_back) in [
+            (libc::ENOSPC, true),
+            (libc::EFBIG, true),
+            (libc::ENOMEM, true),
+            (libc::EINTR, false),
+            (libc::EOPNOTSUPP, false),
+        ] {
+            assert_eq!(
+                needs_fallback(&io::Error::from_raw_os_error(errno)),
+                falls_back
+            );
+        }
+    }
+
+    #[test]
+    fn downloads_that_would_leave_too_little_ram_go_sized_to_the_fallback() {
+        let (tmp, fallback) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let len = |file: &NamedTempFile| file.as_file().metadata().unwrap().len();
+        let count = |dir: &tempfile::TempDir| fs::read_dir(dir.path()).unwrap().count();
+        let size = 1 << 16;
+        for ram in [None, Some(size + RAM_RESERVE)] {
+            let file = temp_file(tmp.path(), fallback.path(), size, ram).unwrap();
+            assert!(file.path().starts_with(tmp.path()));
+            assert_eq!(len(&file), size);
+        }
+        let ram = Some(size + RAM_RESERVE - 1);
+        let file = temp_file(tmp.path(), fallback.path(), size, ram).unwrap();
+        assert!(file.path().starts_with(fallback.path()));
+        assert_eq!(len(&file), size);
+        assert_eq!((count(&tmp), count(&fallback)), (0, 1));
     }
 }

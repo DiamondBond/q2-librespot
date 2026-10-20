@@ -75,6 +75,13 @@ handoff saves it).
 
 librespot is started with:
 
+  --tmp /tmp/q2-librespot.tmp --tmp-fallback ./tmp
+      this branch: each download's space is reserved in /tmp, a tmpfs of
+      half the RAM, and one that does not fit, or would leave less than
+      24 MiB of RAM, goes to .spotify/tmp on the card instead (on a 128 MB
+      unit, anything longer than about 50 minutes at 160 kbit/s, or 25 at
+      320). The card has no sparse files, so such a file is written whole
+      before it plays, which delays its start. run empties both at each start
   --backend subprocess --device "/bin/sh ./aplay.sh"
       aplay runs only while librespot plays, so the PCM is free for local
       music whenever it is paused (hciplayer takes one client per PCM)
@@ -108,8 +115,9 @@ librespot is started with:
 
 The Q2 has no shell (no adb, telnet or ssh, only a UART on ttyS3), so
 logs go to the card: spot.log, aplay.log. With a file named debug in
-.spotify, load.log gets the load average and librespot's VmRSS every 10 s,
-and Q2 Pod writes q2pod.log (each hand-over step).
+.spotify, load.log gets the load average, librespot's VmRSS and the RAM's
+MemAvailable and Shmem (tmpfs) every 10 s, and Q2 Pod writes q2pod.log
+(each hand-over step).
 
 Power the Q2 off before taking the card out or putting it in: swapping it
 while the Q2 was on or asleep corrupted the FAT twice.
