@@ -5,8 +5,9 @@
 # run exit and lets Q2 Pod stop it. With a file named debug here, load.log gets the load,
 # librespot's memory and the free RAM every 10 s. .cache-size, which Q2 Pod's Streaming >
 # Configuration writes ("4096M"), caps the audio cache, read at each start; 2G when it is missing
-# or malformed. Streams download to /tmp/q2-librespot.tmp, in RAM, or to ./tmp when RAM is short;
-# both are emptied at each start, as a killed librespot leaves its files there.
+# or malformed. .quality (96, 160 or 320) is the bitrate in kbit/s, read the same way; 320 by
+# default. Streams download to /tmp/q2-librespot.tmp, in RAM, or to ./tmp when RAM is short; both
+# are emptied at each start, as a killed librespot leaves its files there.
 cd /mnt/mmc/.spotify || exit 1
 [ -e /tmp/q2-librespot ] && exit 0
 wait=5
@@ -14,8 +15,10 @@ while :; do
     start=$(date +%s)
     limit=$(cat .cache-size 2>/dev/null)
     case $limit in '' | [!0-9]* | *[!0-9KMG]* | *[KMG]?*) limit=2G ;; esac
+    q=$(tr -cd 0-9 < .quality 2>/dev/null)
+    case $q in 96 | 160 | 320) ;; *) q=320 ;; esac
     rm -rf /tmp/q2-librespot.tmp ./tmp
-    ./librespot -n Q2 -b 160 --cache ./cache --cache-size-limit "$limit" \
+    ./librespot -n Q2 -b "$q" --cache ./cache --cache-size-limit "$limit" \
         --tmp /tmp/q2-librespot.tmp --tmp-fallback ./tmp \
         --backend subprocess --device "/bin/sh ./aplay.sh" \
         --volume-ctrl fixed --initial-volume 100 \
