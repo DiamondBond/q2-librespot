@@ -108,6 +108,7 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        cached_only: bool,
     },
     Preload {
         track_id: SpotifyUri,
@@ -550,6 +551,16 @@ impl Player {
             track_id,
             play: start_playing,
             position_ms,
+            cached_only: false,
+        });
+    }
+
+    pub fn load_cached(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.command(PlayerCommand::Load {
+            track_id,
+            play: start_playing,
+            position_ms,
+            cached_only: true,
         });
     }
 
@@ -696,6 +707,7 @@ enum PlayerState {
         track_id: SpotifyUri,
         play_request_id: u64,
         start_playback: bool,
+        cached_only: bool,
         loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
     },
     Paused {
@@ -972,6 +984,7 @@ pub fn serves_bitrate(format: AudioFileFormat, bitrate: Bitrate) -> bool {
 }
 
 struct PlayerTrackLoader {
+    cached_only: bool,
     session: Session,
     config: PlayerConfig,
     local_file_lookup: Arc<LocalFileLookup>,
@@ -1031,6 +1044,11 @@ impl PlayerTrackLoader {
                 .into_iter()
                 .find(|item| item.uri == track_uri.to_uri().unwrap_or_default())
         });
+        if self.cached_only {
+            return self
+                .load_remote_item(track_uri, position_ms, Some(saved?))
+                .await;
+        }
         // A saved copy plays offline, and online when it is as good as the bitrate asks for. A
         // lower one is streamed again (that copy replaces it once complete), and plays when
         // streaming fails or does not start within UPGRADE_TIMEOUT.
@@ -1137,7 +1155,18 @@ impl PlayerTrackLoader {
         // This is only a loop to be able to reload the file if an error occurred
         // while opening a cached file.
         loop {
-            let encrypted_file = AudioFile::open(&self.session, file_id, bytes_per_second);
+            let encrypted_file = async {
+                if self.cached_only {
+                    let file = self
+                        .session
+                        .cache()
+                        .and_then(|c| c.file(file_id))
+                        .ok_or_else(|| Error::not_found("Downloaded audio missing"))?;
+                    Ok(AudioFile::Cached(file))
+                } else {
+                    AudioFile::open(&self.session, file_id, bytes_per_second).await
+                }
+            };
 
             let encrypted_file = match encrypted_file.await {
                 Ok(encrypted_file) => encrypted_file,
@@ -1250,7 +1279,7 @@ impl PlayerTrackLoader {
 
             let mut decoder = match decoder_type {
                 Ok(decoder) => decoder,
-                Err(e) if is_cached => {
+                Err(e) if is_cached && !self.cached_only => {
                     warn!("Unable to read cached audio file: {e}. Trying to download it.");
 
                     match self.session.cache() {
@@ -1458,6 +1487,7 @@ impl Future for PlayerInternal {
                 ref track_id,
                 start_playback,
                 play_request_id,
+                ..
             } = self.state
             {
                 // The loader may be terminated if we are trying to load the same track
@@ -2052,10 +2082,15 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        cached_only: bool,
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
+        if cached_only {
+            self.preload = PlayerPreload::None;
+            self.handle_player_stop();
+        }
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
 
         if !self.config.gapless {
@@ -2243,14 +2278,16 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader.unwrap_or_else(|| {
+            Box::pin(self.load_track(track_id.clone(), position_ms, cached_only))
+        });
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
             track_id,
             play_request_id,
             start_playback: play,
+            cached_only,
             loader,
         };
 
@@ -2300,7 +2337,7 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(track_id.clone(), 0, false);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2317,6 +2354,7 @@ impl PlayerInternal {
             ref track_id,
             play_request_id,
             start_playback,
+            cached_only,
             ..
         } = self.state
         {
@@ -2325,6 +2363,7 @@ impl PlayerInternal {
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                cached_only,
             );
         }
 
@@ -2381,7 +2420,8 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                cached_only,
+            } => self.handle_command_load(track_id, None, play, position_ms, cached_only)?,
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
 
@@ -2492,6 +2532,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        cached_only: bool,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2500,6 +2541,7 @@ impl PlayerInternal {
         // future to work with.
 
         let loader = PlayerTrackLoader {
+            cached_only,
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),

@@ -157,6 +157,16 @@ pub struct StreamLoaderController {
 }
 
 impl StreamLoaderController {
+    /// Transfer causes for a background downloader, before a generic wait timeout hides them.
+    pub fn take_error(&self) -> Option<Error> {
+        self.stream_shared
+            .as_ref()?
+            .transfer_error
+            .lock()
+            .unwrap()
+            .take()
+    }
+
     pub fn len(&self) -> usize {
         self.file_size
     }
@@ -324,6 +334,7 @@ struct AudioFileDownloadStatus {
 }
 
 struct AudioFileShared {
+    transfer_error: Mutex<Option<Error>>,
     cdn_url: String,
     file_size: usize,
     bytes_per_second: usize,
@@ -447,6 +458,7 @@ impl AudioFileStreaming {
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
         let mut response_streamer_url = None;
+        let mut last_error = None;
         let urls = cdn_url.try_get_urls()?;
         for url in &urls {
             // When the audio file is really small, this `download_size` may turn out to be
@@ -472,15 +484,17 @@ impl AudioFileStreaming {
                     response_streamer_url = Some((r, streamer, url));
                     break;
                 }
-                Err(e) => warn!("Fetching {url} failed with error {e:?}, trying next"),
+                Err(e) => {
+                    warn!("Fetching {url} failed with error {e:?}, trying next");
+                    last_error = Some(e);
+                }
             }
         }
 
         let Some((response, streamer, url)) = response_streamer_url else {
-            return Err(Error::unavailable(format!(
-                "{} URLs failed, none left to try",
-                urls.len()
-            )));
+            return Err(last_error.unwrap_or_else(|| {
+                Error::unavailable(format!("{} URLs failed, none left to try", urls.len()))
+            }));
         };
 
         trace!("Streaming from {url}");
@@ -488,7 +502,15 @@ impl AudioFileStreaming {
         let code = response.status();
         if code != StatusCode::PARTIAL_CONTENT {
             debug!("Opening audio file expected partial content but got: {code}");
-            return Err(AudioFileError::StatusCode(code).into());
+            use librespot_core::http_client::HttpClientError;
+            if code == StatusCode::TOO_MANY_REQUESTS {
+                if let Some(wait) =
+                    librespot_core::http_client::HttpClient::retry_after(response.headers())
+                {
+                    return Err(HttpClientError::RetryAfter(wait).into());
+                }
+            }
+            return Err(HttpClientError::StatusCode(code).into());
         }
 
         let header_value = response
@@ -509,6 +531,7 @@ impl AudioFileStreaming {
         };
 
         let shared = Arc::new(AudioFileShared {
+            transfer_error: Mutex::new(None),
             cdn_url: url.to_string(),
             file_size,
             bytes_per_second,
@@ -546,14 +569,25 @@ impl AudioFileStreaming {
         let (stream_loader_command_tx, stream_loader_command_rx) =
             mpsc::unbounded_channel::<StreamLoaderCommand>();
 
-        session.spawn(audio_file_fetch(
-            session.clone(),
-            shared.clone(),
-            initial_request,
-            write_file,
-            stream_loader_command_rx,
-            complete_tx,
-        ));
+        let error_shared = shared.clone();
+        let fetch_session = session.clone();
+        let fetch_shared = shared.clone();
+        session.spawn(async move {
+            if let Err(e) = audio_file_fetch(
+                fetch_session,
+                fetch_shared,
+                initial_request,
+                write_file,
+                stream_loader_command_rx,
+                complete_tx,
+            )
+            .await
+            {
+                error!("Audio fetch failed: {e}");
+                *error_shared.transfer_error.lock().unwrap() = Some(e);
+            }
+            Ok::<(), Error>(())
+        });
 
         Ok(AudioFileStreaming {
             read_file,

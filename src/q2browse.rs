@@ -2,6 +2,9 @@
 //! response per connection, described in q2-pod's docs/librespot.md. It shares the main loop's
 //! session and Spirc, and keeps nothing between requests: cursors carry the paging state.
 
+#[path = "q2downloads.rs"]
+mod downloads;
+
 use crate::status_file::write_atomic;
 use librespot::{
     audio::AudioFile,
@@ -48,7 +51,7 @@ use tokio::{
 };
 
 /// This backend's version, answered by `caps`.
-pub const VERSION: &str = "q2-v1.6";
+pub const VERSION: &str = "q2-v1.9";
 const MAGIC: &str = "Q2SPOT/1";
 const MAX_REQUEST: usize = 8 * 1024;
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -63,11 +66,10 @@ const PAGING_BUDGET: Duration = Duration::from_secs(10);
 const SAVED_MAX: usize = 1000;
 /// Throttled without a Retry-After: hold off this long.
 const THROTTLE_DEFAULT: Duration = Duration::from_secs(30);
-const THROTTLE_MAX: Duration = Duration::from_secs(3600);
 
 /// Ops with their minimum and maximum argument counts, and whether they mutate (a newer
 /// request never aborts those).
-const OPS: [(&str, usize, usize, bool); 22] = [
+const OPS: &[(&str, usize, usize, bool)] = &[
     ("caps", 0, 0, false),
     ("account", 0, 0, false),
     ("playlists", 0, 1, false),
@@ -90,6 +92,15 @@ const OPS: [(&str, usize, usize, bool); 22] = [
     ("playdownload", 1, 1, true),
     ("download", 1, 1, true),
     ("downloadstatus", 0, 0, false),
+    ("collections", 0, 1, false),
+    ("collection", 1, 2, false),
+    ("playcollection", 2, 2, true),
+    ("downloadliked", 0, 0, true),
+    ("savetrack", 1, 1, true),
+    ("jobs", 0, 1, false),
+    ("jobstatus", 1, 1, false),
+    ("job", 2, 2, true),
+    ("remove", 2, 3, true),
 ];
 
 pub struct OfflinePlayback {
@@ -99,23 +110,43 @@ pub struct OfflinePlayback {
     bitrate: Bitrate,
     current: Mutex<Option<OfflineQueue>>,
     download: Mutex<Download>,
+    download_control: tokio::sync::Mutex<()>,
+    library_write: Mutex<()>,
+    download_wake: tokio::sync::Notify,
 }
 
 struct Download {
+    session: Option<Session>,
     task: Option<tokio::task::JoinHandle<()>>,
     message: String,
 }
 
 // The UI reads this independently of playback, so downloads keep the service awake without
 // taking the audio device. It is reset each time the backend starts.
+#[cfg(not(test))]
 const DOWNLOAD_FILE: &str = "/tmp/q2-librespot.download";
+fn download_file() -> std::path::PathBuf {
+    #[cfg(not(test))]
+    {
+        DOWNLOAD_FILE.into()
+    }
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!(
+            "q2-download-state-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("worker")
+        ))
+    }
+}
 
 fn download_state(running: bool, message: &str) {
     let text = format!("downloading={}\nmessage={}\n", u8::from(running), message);
-    write_atomic(Path::new(DOWNLOAD_FILE), text.as_bytes());
+    write_atomic(&download_file(), text.as_bytes());
 }
 
 struct OfflineQueue {
+    protected_only: bool,
     uris: Vec<String>,
     at: usize,
     playing: bool,
@@ -131,11 +162,16 @@ impl OfflinePlayback {
             player: player.clone(),
             bitrate,
             current: Mutex::new(None),
+            download_control: tokio::sync::Mutex::new(()),
+            library_write: Mutex::new(()),
+            download_wake: tokio::sync::Notify::new(),
             download: Mutex::new(Download {
+                session: None,
                 task: None,
                 message: "No playlist download started".into(),
             }),
         });
+        this.recover_downloads();
         download_state(false, &this.download.lock().unwrap().message);
         let (weak, mut events) = (Arc::downgrade(&this), player.get_player_event_channel());
         tokio::spawn(async move {
@@ -161,6 +197,9 @@ impl OfflinePlayback {
             }
             PlayerEvent::EndOfTrack {
                 play_request_id, ..
+            }
+            | PlayerEvent::Unavailable {
+                play_request_id, ..
             } if queue.id == Some(play_request_id) => {
                 // At the list's end, stop as Spirc does at a context's end: otherwise the state
                 // stays "playing" and the sink keeps the audio device.
@@ -180,7 +219,18 @@ impl OfflinePlayback {
     /// Loads the next (or previous) track of the captured list that is still cached, skipping
     /// evicted ones; false when there is none.
     fn step(&self, queue: &mut OfflineQueue, forward: bool) -> bool {
-        let cached: Vec<String> = self.tracks().into_iter().map(|item| item.uri).collect();
+        let cached: Vec<String> = self
+            .tracks()
+            .into_iter()
+            .filter(|t| {
+                !queue.protected_only
+                    || self
+                        .cache
+                        .as_ref()
+                        .is_some_and(|c| c.protected(librespot::core::FileId(t.file)))
+            })
+            .map(|item| item.uri)
+            .collect();
         let mut at = queue.at;
         loop {
             at = match if forward {
@@ -196,7 +246,7 @@ impl OfflinePlayback {
             }
             if let Ok(id) = SpotifyUri::from_uri(&queue.uris[at]) {
                 (queue.at, queue.playing, queue.loading) = (at, true, true);
-                self.player.load(id, true, 0);
+                self.player.load_cached(id, true, 0);
                 return true;
             }
         }
@@ -210,7 +260,11 @@ impl OfflinePlayback {
             .credentials()
             .and_then(|c| c.username)
             .unwrap_or_default();
-        cache.offline_tracks(&account)
+        cache
+            .offline_tracks(&account)
+            .into_iter()
+            .filter(|t| t.duration_ms > 0 && AudioFileFormat::try_from(t.format).is_ok())
+            .collect()
     }
 
     fn page(&self, cursor: &str) -> Result<Page, Fail> {
@@ -244,13 +298,14 @@ impl OfflinePlayback {
         };
         let id = SpotifyUri::from_uri(uri).map_err(|_| fail(Status::Bad))?;
         *self.current.lock().unwrap() = Some(OfflineQueue {
+            protected_only: false,
             uris: tracks.into_iter().map(|item| item.uri).collect(),
             at,
             playing: true,
             id: None,
             loading: true,
         });
-        self.player.load(id, true, 0);
+        self.player.load_cached(id, true, 0);
         Ok(Page::default())
     }
 
@@ -296,89 +351,16 @@ impl OfflinePlayback {
         }
     }
 
-    async fn download(
-        self: &Arc<Self>,
-        uri: &str,
-        link: &mut watch::Receiver<Link>,
-    ) -> Result<Page, Fail> {
-        uri_of(uri, "playlist")?;
-        if self.cache.is_none() {
-            return Err(Fail(Status::Unavailable, "Audio cache is disabled".into()));
-        }
-        let (session, _) = ready(link).await?;
-        let mut download = self.download.lock().unwrap();
-        if download
-            .task
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
-        {
-            return Err(Fail(
-                Status::Unavailable,
-                "A playlist is already downloading".into(),
-            ));
-        }
-        download.message = "Playlist download started".into();
-        download_state(true, &download.message);
-        let (this, uri) = (self.clone(), uri.to_owned());
-        download.task = Some(tokio::spawn(async move {
-            this.download_playlist(session, uri).await;
-        }));
-        Ok(Page {
-            message: download.message.clone(),
-            ..Default::default()
-        })
-    }
-
-    async fn download_playlist(&self, session: Session, uri: String) {
-        let mut saved = 0;
-        let mut failed = 0;
-        let mut from = 0;
-        let result: Result<(), Fail> = async {
-            loop {
-                let page = tokio::time::timeout(DEADLINE, playlist(&session, &uri, from))
-                    .await
-                    .map_err(|_| fail(Status::Offline))??;
-                for row in page.rows {
-                    if download_track(&session, &row.uri, self.bitrate)
-                        .await
-                        .is_ok()
-                    {
-                        saved += 1;
-                    } else {
-                        failed += 1;
-                        warn!("Playlist download failed for {}", row.uri);
-                    }
-                    let message = format!("Downloaded {saved} tracks ({failed} failed)");
-                    self.download.lock().unwrap().message = message.clone();
-                    download_state(true, &message);
-                }
-                if page.cursor.is_empty() {
-                    break;
-                }
-                let next = offset(&page.cursor)?;
-                if next <= from {
-                    return Err(fail(Status::Error));
-                }
-                from = next;
-            }
-            Ok(())
-        }
-        .await;
-        let message = match result {
-            Ok(()) => format!("Download finished: {saved} tracks, {failed} failed"),
-            Err(error) => format!("Download stopped: {} ({saved} saved)", error.1),
-        };
-        self.download.lock().unwrap().message = message.clone();
-        download_state(false, &message);
-    }
-
-    pub fn cancel_download(&self) {
-        let mut download = self.download.lock().unwrap();
-        if let Some(task) = download.task.take() {
+    pub async fn cancel_download(&self) {
+        let _control = self.download_control.lock().await;
+        let task = self.download.lock().unwrap().task.take();
+        if let Some(task) = task {
             task.abort();
+            let _ = task.await;
         }
-        download.message = "Download stopped".into();
-        download_state(false, &download.message);
+        self.recover_downloads();
+        self.download.lock().unwrap().message = "Download stopped".into();
+        download_state(false, "Download stopped");
     }
 
     pub fn end(&self) {
@@ -407,11 +389,14 @@ fn download_formats(bitrate: Bitrate, saved: Option<AudioFileFormat>) -> Vec<Aud
 /// saved copy still counts as downloaded when that fails.
 async fn download_track(session: &Session, uri: &str, bitrate: Bitrate) -> Result<(), Fail> {
     let cache = session.cache().ok_or_else(|| fail(Status::Unavailable))?;
-    let saved = cache
+    let saved_track = cache
         .offline_tracks(&session.username())
         .into_iter()
-        .find(|track| track.uri == uri)
-        .and_then(|track| AudioFileFormat::try_from(track.format).ok());
+        .find(|track| track.uri == uri);
+    if let Some(track) = &saved_track {
+        cache.protect(track)?;
+    }
+    let saved = saved_track.and_then(|track| AudioFileFormat::try_from(track.format).ok());
     let formats = download_formats(bitrate, saved);
     let Some(&first) = formats.first() else {
         return Ok(());
@@ -450,7 +435,7 @@ async fn fetch_track(
         .find_map(|format| item.files.get(&format).map(|file| (format, *file)))
         .ok_or_else(|| fail(Status::Unavailable))?;
     let key = session.audio_key().request(track_id, file).await?;
-    let audio = AudioFile::open(session, file, stream_data_rate(format)).await?;
+    let mut audio = AudioFile::open(session, file, stream_data_rate(format)).await?;
     let controller = audio.get_stream_loader_controller()?;
     // Closing on cancellation also stops its network fetch before sign-out clears the cache.
     struct Close(librespot::audio::StreamLoaderController);
@@ -463,15 +448,8 @@ async fn fetch_track(
     controller.0.fetch_next_and_wait(controller.0.len(), 0)?;
     // AudioFile's completion callback saves the whole encrypted file atomically.
     while !controller.0.range_to_end_available() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let saved_by = tokio::time::Instant::now() + Duration::from_secs(10);
-    while cache.file(file).is_none() {
-        if tokio::time::Instant::now() >= saved_by {
-            return Err(Fail(
-                Status::Unavailable,
-                "Audio cache is full or unwritable".into(),
-            ));
+        if let Some(error) = controller.0.take_error() {
+            return Err(error.into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -479,9 +457,9 @@ async fn fetch_track(
         return Err(fail(Status::Unavailable));
     }
     let (artist, album) = item.unique_fields.artist_album();
-    cache.save_offline_track(&OfflineTrack {
+    let record = OfflineTrack {
         account: session.username(),
-        uri: item.uri,
+        uri: uri.into(),
         file: file.0,
         format: format as i32,
         key: Some(key.0),
@@ -491,7 +469,11 @@ async fn fetch_track(
         duration_ms: item.duration_ms,
         is_explicit: item.is_explicit,
         played_at: unix_ms(),
-    })?;
+    };
+    use std::io::{Seek, SeekFrom};
+    audio.seek(SeekFrom::Start(0)).map_err(Error::from)?;
+    cache.protect_contents(&record, &mut audio)?;
+    cache.save_offline_track(&record)?;
     Ok(())
 }
 
@@ -501,6 +483,8 @@ fn offline_account(cache: Option<&Cache>, link: &Link) -> bool {
 }
 
 /// Throttle deadlines: spclient, and Pathfinder (search) on its own host.
+#[cfg(test)]
+static THROTTLE_TEST: Mutex<()> = Mutex::new(());
 static THROTTLED: Mutex<[Option<Instant>; 2]> = Mutex::new([None; 2]);
 const SPCLIENT: usize = 0;
 const PATHFINDER: usize = 1;
@@ -536,12 +520,14 @@ enum Status {
     Unsupported,
     Bad,
     Error,
+    Storage,
 }
 
 impl Status {
     /// The wire name and the default message.
     fn text(self) -> (&'static str, &'static str) {
         match self {
+            Status::Storage => ("storage", "Check card space and write access, then Resume"),
             Status::Ok => ("ok", ""),
             Status::Login => ("login", "Open Spotify on your phone and choose Q2"),
             Status::Offline => ("offline", "Spotify can't be reached"),
@@ -597,11 +583,37 @@ fn failed(e: Error, host: usize) -> Fail {
     // Error's text holds no tokens: a kind and a status code or I/O cause
     warn!("Browse request failed: {e}");
     let (status, wait) = classify(&e);
-    if status != Status::Throttled {
-        return fail(status);
+    if e.error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::StorageFull
+                | std::io::ErrorKind::ReadOnlyFilesystem
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::WriteZero
+                | std::io::ErrorKind::FileTooLarge
+                | std::io::ErrorKind::OutOfMemory
+        )
+    }) {
+        return Fail(
+            Status::Storage,
+            format!("Card: {e}. Check free space and write access"),
+        );
     }
-    let wait = wait.unwrap_or(THROTTLE_DEFAULT).min(THROTTLE_MAX);
-    THROTTLED.lock().unwrap()[host] = Some(Instant::now() + wait);
+    if status != Status::Throttled {
+        return Fail(status, format!("{}: {e}", status.text().1));
+    }
+    let wait = wait.unwrap_or(THROTTLE_DEFAULT).max(Duration::from_secs(1));
+    let Some(until) = Instant::now().checked_add(wait) else {
+        return Fail(
+            Status::Error,
+            "Invalid Spotify cooldown; retry later".into(),
+        );
+    };
+    let mut deadlines = THROTTLED.lock().unwrap();
+    deadlines[host] = Some(deadlines[host].map_or(until, |old| old.max(until)));
     throttled(wait)
 }
 
@@ -888,11 +900,27 @@ async fn run(
         }
         "downloaded" => return offline.page(last),
         "playdownload" => return offline.play(arg(0)),
-        "download" => return offline.download(arg(0), link).await,
+        "download" | "savetrack" => return offline.save_collection(arg(0), link).await,
+        "downloadliked" => return offline.save_collection("liked", link).await,
+        "collections" => return offline.collections(last),
+        "collection" => return offline.collection(arg(0), last),
+        "playcollection" => return offline.play_collection(arg(0), arg(1)),
+        "jobs" => return offline.jobs(last),
+        "jobstatus" => return offline.job_status(arg(0)),
+        "job" => return offline.job_control(arg(0), arg(1), link).await,
+        "remove" => {
+            if !arg(2).is_empty() && arg(2) != "confirm" {
+                return Err(fail(Status::Bad));
+            }
+            return offline
+                .remove_downloads(arg(0), arg(1), arg(2) == "confirm")
+                .await;
+        }
         "downloadstatus" => return Ok(offline.download_status()),
         _ => {}
     }
     let (session, spirc) = ready(link).await?;
+    session.http_client().report_rate_limits();
     // only ops that ask Spotify's web APIs wait out a throttle; Connect commands never do
     let host = match op.as_str() {
         "search" => Some(PATHFINDER),
@@ -1626,6 +1654,9 @@ mod tests {
                 &mut &b"complete audio"[..],
             )
             .unwrap();
+        cache.save_credentials(
+            &librespot::core::authentication::Credentials::with_password("alice", "test"),
+        );
         // 160 kbit/s serves 160 and 96: neither asks the network.
         download_track(&session, &record.uri, Bitrate::Bitrate160)
             .await
@@ -1711,6 +1742,7 @@ mod tests {
         );
         let offline = OfflinePlayback::new(Some(cache), player, Bitrate::Bitrate320);
         *offline.current.lock().unwrap() = Some(OfflineQueue {
+            protected_only: false,
             uris: uris.clone(),
             at: 0,
             playing: true,
@@ -1751,32 +1783,17 @@ mod tests {
         );
         let offline = OfflinePlayback::new(None, player, Bitrate::Bitrate320);
         download_state(true, "Starting");
-        // Exercise the real job's failure cleanup without a Spotify/network dependency.
-        offline
-            .download_playlist(session, "bad playlist URI".into())
-            .await;
-        assert!(
-            offline
-                .download_status()
-                .message
-                .starts_with("Download stopped:")
-        );
-        assert!(
-            std::fs::read_to_string(DOWNLOAD_FILE)
-                .unwrap()
-                .starts_with("downloading=0\n")
-        );
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
         offline.download.lock().unwrap().task = Some(task);
         download_state(true, "Starting");
-        offline.cancel_download();
+        offline.cancel_download().await;
         tokio::task::yield_now().await;
         assert!(abort.is_finished());
         assert!(offline.download.lock().unwrap().task.is_none());
         assert_eq!(offline.download_status().message, "Download stopped");
         assert!(
-            std::fs::read_to_string(DOWNLOAD_FILE)
+            std::fs::read_to_string(download_file())
                 .unwrap()
                 .starts_with("downloading=0\n")
         );
@@ -2153,17 +2170,18 @@ mod tests {
     }
 
     #[test]
-    fn throttling_holds_off_one_host_for_at_most_an_hour() {
+    fn throttling_honors_retry_after_and_holds_off_each_host() {
+        let _guard = THROTTLE_TEST.lock().unwrap();
         let fail = failed(
             HttpClientError::RetryAfter(Duration::from_secs(90)).into(),
             PATHFINDER,
         );
         assert_eq!(fail.0, Status::Throttled);
         assert!(fail.1.contains("90 s"));
-        let huge = Duration::from_secs(u64::MAX / 4);
-        failed(HttpClientError::RetryAfter(huge).into(), SPCLIENT);
+        let long = Duration::from_secs(7200);
+        failed(HttpClientError::RetryAfter(long).into(), SPCLIENT);
         let [spclient, pathfinder] = *THROTTLED.lock().unwrap();
-        assert!(spclient.unwrap() <= Instant::now() + THROTTLE_MAX);
+        assert!(spclient.unwrap() > Instant::now() + Duration::from_secs(7100));
         assert!(pathfinder.unwrap() > Instant::now() + Duration::from_secs(80));
         forget_throttling();
         assert_eq!(*THROTTLED.lock().unwrap(), [None, None]);

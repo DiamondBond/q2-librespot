@@ -2157,7 +2157,7 @@ async fn main() {
                 if let Some(Err(e)) = setup.cache.as_ref().map(Cache::remove_credentials) {
                     error!("Could not remove the saved login: {e}");
                 }
-                offline.cancel_download();
+                offline.cancel_download().await;
                 offline.end();
                 player.stop();
                 if let Some(Err(e)) = setup.cache.as_ref().map(Cache::clear_offline) {

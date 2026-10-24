@@ -433,7 +433,190 @@ impl Cache {
         }
     }
 
+    fn account_protected_path(&self, account: &str, file: FileId) -> Option<PathBuf> {
+        let name: String = account
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        Some(
+            self.offline_location
+                .as_ref()?
+                .join("audio")
+                .join(name)
+                .join(file.to_base16().ok()?),
+        )
+    }
+
+    fn protected_path(&self, file: FileId) -> Option<PathBuf> {
+        self.account_protected_path(&self.credentials()?.username?, file)
+    }
+
+    pub fn protected(&self, file: FileId) -> bool {
+        self.credentials()
+            .and_then(|c| c.username)
+            .is_some_and(|a| self.protected_for(&a, file))
+    }
+
+    fn protected_for(&self, account: &str, file: FileId) -> bool {
+        self.account_protected_path(account, file).is_some_and(|p| {
+            let expected = fs::read_to_string(p.with_extension("size"))
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            expected
+                .is_some_and(|n| n > 0 && p.metadata().is_ok_and(|m| m.is_file() && m.len() == n))
+        })
+    }
+
+    /// Copy, sync and rename before claiming protection; never involve the cache limiter.
+    pub fn protect(&self, track: &OfflineTrack) -> Result<(), Error> {
+        let _write = self.offline_write.lock().unwrap();
+        if track.key.is_none() || track.account.is_empty() || track.title.is_empty() {
+            return Err(Error::invalid_argument("Incomplete download metadata"));
+        }
+        let mut source = self
+            .file(FileId(track.file))
+            .ok_or_else(|| Error::not_found("Complete audio missing"))?;
+        self.write_protected(track, &mut source)
+    }
+
+    pub fn protect_contents<F: Read>(
+        &self,
+        track: &OfflineTrack,
+        contents: &mut F,
+    ) -> Result<(), Error> {
+        let _write = self.offline_write.lock().unwrap();
+        self.write_protected(track, contents)
+    }
+
+    fn write_protected<F: Read>(
+        &self,
+        track: &OfflineTrack,
+        contents: &mut F,
+    ) -> Result<(), Error> {
+        let path = self
+            .account_protected_path(&track.account, FileId(track.file))
+            .ok_or(CacheError::Path)?;
+        if track.key.is_none()
+            || track.account.is_empty()
+            || track.title.is_empty()
+            || track.duration_ms == 0
+        {
+            return Err(Error::invalid_argument("Incomplete download metadata"));
+        }
+        if self.protected_for(&track.account, FileId(track.file)) {
+            return Ok(());
+        }
+        fs::create_dir_all(path.parent().ok_or(CacheError::Path)?)?;
+        let tmp = path.with_extension("tmp");
+        let mut out = File::create(&tmp)?;
+        let size = io::copy(contents, &mut out)?;
+        if size == 0 {
+            return Err(Error::data_loss("Empty audio"));
+        }
+        out.sync_all()?;
+        fs::rename(tmp, &path)?;
+        let size_path = path.with_extension("size");
+        let size_tmp = size_path.with_extension("size.tmp");
+        let mut out = File::create(&size_tmp)?;
+        out.write_all(size.to_string().as_bytes())?;
+        out.sync_all()?;
+        fs::rename(size_tmp, size_path)?;
+        File::open(path.parent().ok_or(CacheError::Path)?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn download_path(&self, account: &str) -> Result<PathBuf, Error> {
+        if account.is_empty() {
+            return Err(Error::unauthenticated("No saved account"));
+        }
+        let name: String = account
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(self
+            .offline_location
+            .as_ref()
+            .ok_or(CacheError::Path)?
+            .join("collections")
+            .join(name))
+    }
+
+    pub fn download_records<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        account: &str,
+    ) -> Result<T, Error> {
+        match fs::read(self.download_path(account)?) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save_download_records<T: Serialize>(
+        &self,
+        account: &str,
+        records: &T,
+    ) -> Result<(), Error> {
+        let _write = self.offline_write.lock().unwrap();
+        let path = self.download_path(account)?;
+        fs::create_dir_all(path.parent().ok_or(CacheError::Path)?)?;
+        let tmp = path.with_extension("tmp");
+        let mut out = File::create(&tmp)?;
+        out.write_all(&serde_json::to_vec(records)?)?;
+        out.sync_all()?;
+        fs::rename(tmp, &path)?;
+        File::open(path.parent().ok_or(CacheError::Path)?)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn remove_download_track(&self, track: &OfflineTrack) -> Result<(), Error> {
+        let _write = self.offline_write.lock().unwrap();
+        for path in [
+            self.account_protected_path(&track.account, FileId(track.file))
+                .map(|p| p.with_extension("size")),
+            self.account_protected_path(&track.account, FileId(track.file)),
+            self.file_path(FileId(track.file)),
+            self.offline_location
+                .as_ref()
+                .map(|p| p.join(FileId(track.file).to_base16().unwrap())),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(limiter) = &self.size_limiter {
+                        limiter.remove(&path);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let Some(path) = track
+            .uri
+            .rsplit(':')
+            .next()
+            .and_then(|id| self.offline_cover_path(id))
+        {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub fn file(&self, file: FileId) -> Option<File> {
+        if self.protected(file) {
+            return self.protected_path(file).and_then(|p| File::open(p).ok());
+        }
         let path = self.file_path(file)?;
         match File::open(&path) {
             Ok(file) => {
@@ -473,6 +656,7 @@ impl Cache {
                     return Ok(path);
                 }
                 let _ = fs::remove_file(tmp);
+                return Err(result.unwrap_err().into());
             }
         }
         Err(CacheError::Path.into())
@@ -486,12 +670,16 @@ impl Cache {
         let path = dir.join(name);
         let tmp = path.with_extension("tmp");
         let data = serde_json::to_vec(track)?;
-        File::create(&tmp)?.write_all(&data)?;
+        let mut out = File::create(&tmp)?;
+        out.write_all(&data)?;
+        out.sync_all()?;
         fs::rename(tmp, path)?;
+        File::open(dir)?.sync_all()?;
         Ok(())
     }
 
     pub fn offline_tracks(&self, account: &str) -> Vec<OfflineTrack> {
+        let _write = self.offline_write.lock().unwrap();
         let Some(dir) = &self.offline_location else {
             return Vec::new();
         };
@@ -518,7 +706,11 @@ impl Cache {
             if FileId(track.file).to_base16().ok().as_deref() != entry.file_name().to_str() {
                 continue;
             }
-            let Some(path) = self.file_path(FileId(track.file)) else {
+            let Some(path) = self
+                .account_protected_path(account, FileId(track.file))
+                .filter(|_| self.protected_for(account, FileId(track.file)))
+                .or_else(|| self.file_path(FileId(track.file)))
+            else {
                 continue;
             };
             let size = path
@@ -526,7 +718,7 @@ impl Cache {
                 .ok()
                 .filter(|m| m.is_file())
                 .map_or(0, |m| m.len());
-            if size > 0 {
+            if size > 0 && track.key.is_some() && !track.title.is_empty() {
                 complete.push((track, size, entry.path()));
             } else if now.saturating_sub(track.played_at) > 86_400_000 {
                 // Evicted audio: its record and art go too, so they stay within the audio's count.
@@ -540,6 +732,10 @@ impl Cache {
         complete.sort_by(|a, b| {
             a.0.uri
                 .cmp(&b.0.uri)
+                .then(
+                    self.protected_for(account, FileId(b.0.file))
+                        .cmp(&self.protected_for(account, FileId(a.0.file))),
+                )
                 .then(b.1.cmp(&a.1))
                 .then(b.0.played_at.cmp(&a.0.played_at))
         });
@@ -550,6 +746,11 @@ impl Cache {
                     let _ = fs::remove_file(record);
                     if kept.file != track.file {
                         let _ = self.remove_file(FileId(track.file));
+                        if let Some(path) = self.account_protected_path(account, FileId(track.file))
+                        {
+                            let _ = fs::remove_file(path.with_extension("size"));
+                            let _ = fs::remove_file(path);
+                        }
                     }
                 }
                 _ => tracks.push(track),
@@ -603,6 +804,31 @@ impl Cache {
             .flatten()
         {
             match fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_downloads(&self, account: &str) -> Result<(), Error> {
+        // Include incomplete records: a failed metadata/audio commit must not strand protected bytes.
+        if let Some(dir) = &self.offline_location {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(bytes) = fs::read(entry.path()) {
+                        if let Ok(track) = serde_json::from_slice::<OfflineTrack>(&bytes) {
+                            if track.account == account {
+                                self.remove_download_track(&track)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(path) = self.account_protected_path(account, FileId([0; 20])) {
+            match fs::remove_dir_all(path.parent().ok_or(CacheError::Path)?) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),

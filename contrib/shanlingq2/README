@@ -146,3 +146,22 @@ hand-over with local music) is described in q2-pod's docs/internals.md
 takes volume changes from Q2 Pod on /tmp/q2sink.sock. Without the file, as
 with older Q2 Pod, it is aplay on the headphone DAC. The output is picked at
 each sink start: one switched while playing takes over after pause and play.
+
+Saved collection downloads (Q2SPOT/1 q2-v1.9 development build)
+----------------------------------------------------------
+Use matching Q2 Pod firmware for the persistent Downloads hub, named playlists
+and Liked Songs in source order, sequential jobs, manual updates, recovery and
+confirmed bulk removal. Interrupted jobs require Resume after restart.
+
+The protected audio under cache/offline/audio/<hex-account>/ is separate from
+cache/files, the evictable playback cache. .cache-size limits only the latter.
+Keep cache/ when updating. Old complete cache tracks remain usable but their
+original playlist grouping cannot be reconstructed; download the playlist again.
+Clear All Downloads preserves login/settings. Sign-out removes login and music.
+Old firmware's download/downloadstatus/downloaded/playdownload operations remain
+supported; new firmware checks advertised capabilities before showing controls.
+
+The shared UX, protocol examples, job states, deletion semantics and Deezer/Qobuz
+maintainer contract live in q2-pod/docs/downloads.md. These builds are staged for
+review only: no publication or card installation is part of implementation.
+Live Spotify/card validation remains required before release.

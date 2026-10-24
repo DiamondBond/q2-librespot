@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use librespot_core::{
     Error,
-    http_client::{HttpClient, RATE_LIMIT_MAX_WAIT},
+    http_client::{HttpClient, HttpClientError},
     session::Session,
 };
 
@@ -88,20 +88,11 @@ async fn receive_data(
         let code = response.status();
         if code != StatusCode::PARTIAL_CONTENT {
             if code == StatusCode::TOO_MANY_REQUESTS {
-                if let Some(duration) = HttpClient::retry_after(response.headers())
-                    .filter(|d| *d <= RATE_LIMIT_MAX_WAIT)
-                {
-                    warn!(
-                        "Rate limiting, retrying in {} seconds...",
-                        duration.as_secs()
-                    );
-                    // sleeping here means we hold onto this streamer "slot"
-                    // (we don't decrease the number of open requests)
-                    tokio::time::sleep(duration).await;
+                if let Some(duration) = HttpClient::retry_after(response.headers()) {
+                    break Err(HttpClientError::RetryAfter(duration).into());
                 }
             }
-
-            break Err(AudioFileError::StatusCode(code).into());
+            break Err(HttpClientError::StatusCode(code).into());
         }
 
         let body = response.into_body();
@@ -147,7 +138,7 @@ async fn receive_data(
             "Streamer error requesting range {} +{}: {:?}",
             request.offset, request.length, e
         );
-        return Err(e);
+        *shared.transfer_error.lock().unwrap() = Some(e);
     }
 
     Ok(())

@@ -1,5 +1,8 @@
 use std::{
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -98,6 +101,7 @@ impl From<HttpClientError> for Error {
 type HyperClient = Client<ProxyConnector<HttpsConnector<HttpConnector>>, Full<bytes::Bytes>>;
 
 pub struct HttpClient {
+    external_rate_limits: AtomicBool,
     user_agent: HeaderValue,
     proxy_url: Option<Url>,
     hyper_client: OnceLock<HyperClient>,
@@ -140,11 +144,17 @@ impl HttpClient {
         let rate_limiter = RateLimiter::keyed(quota);
 
         Self {
+            external_rate_limits: AtomicBool::new(false),
             user_agent,
             proxy_url: proxy_url.cloned(),
             hyper_client: OnceLock::new(),
             rate_limiter,
         }
+    }
+
+    /// Let a caller with a persistent job queue manage cancelable cooldowns across requests.
+    pub fn report_rate_limits(&self) {
+        self.external_rate_limits.store(true, Ordering::Relaxed);
     }
 
     fn try_create_hyper_client(proxy_url: Option<&Url>) -> Result<HyperClient, Error> {
@@ -205,7 +215,10 @@ impl HttpClient {
 
                 if code == StatusCode::TOO_MANY_REQUESTS {
                     match Self::retry_after(response.headers()) {
-                        Some(duration) if duration <= RATE_LIMIT_MAX_WAIT => {
+                        Some(duration)
+                            if duration <= RATE_LIMIT_MAX_WAIT
+                                && !self.external_rate_limits.load(Ordering::Relaxed) =>
+                        {
                             warn!(
                                 "Rate limited by service, retrying in {} seconds...",
                                 duration.as_secs()
@@ -289,7 +302,16 @@ impl HttpClient {
             // Generic RFC compliant (including *.spotify.com)
             if let Ok(retry_after) = header_val.to_str() {
                 if let Ok(duration) = retry_after.parse::<i64>() {
-                    retry_after_ms = Some(duration * 1000)
+                    retry_after_ms = duration.checked_mul(1000)
+                } else if let Ok(target) = time::OffsetDateTime::parse(
+                    retry_after,
+                    &time::format_description::well_known::Rfc2822,
+                ) {
+                    retry_after_ms = Some(
+                        (target.unix_timestamp_nanos() / 1_000_000 - now as i128)
+                            .max(0)
+                            .min(i64::MAX as i128) as i64,
+                    )
                 }
             }
         }
@@ -297,5 +319,33 @@ impl HttpClient {
         retry_after_ms
             .and_then(|ms| u64::try_from(ms).ok())
             .map(Duration::from_millis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retry_after_accepts_seconds_http_dates_and_missing_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(HttpClient::retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("90"));
+        assert_eq!(
+            HttpClient::retry_after(&headers),
+            Some(Duration::from_secs(90))
+        );
+        let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(120);
+        let date = future
+            .format(&time::format_description::well_known::Rfc2822)
+            .unwrap()
+            .replace("+0000", "GMT");
+        headers.insert("retry-after", HeaderValue::from_str(&date).unwrap());
+        let wait = HttpClient::retry_after(&headers).unwrap();
+        assert!(wait >= Duration::from_secs(118) && wait <= Duration::from_secs(120));
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("9223372036854775807"),
+        );
+        assert_eq!(HttpClient::retry_after(&headers), None); // numeric overflow cannot panic
     }
 }
