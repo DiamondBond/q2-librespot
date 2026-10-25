@@ -19,3 +19,24 @@ extern int __register_atfork(void (*)(void), void (*)(void), void (*)(void), voi
 int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void)) {
     return __register_atfork(prepare, parent, child, __dso_handle);
 }
+
+/* glibc 2.34's 64-bit clock, which Rust's std calls instead of clock_gettime when it is linked (a
+ * weak symbol). glibc 2.28's clock_gettime truncates seconds to 32 bits, so SystemTime, rustls'
+ * certificate dates and the session's timestamps would wrap in January 2038. Linux 5.10 has
+ * clock_gettime64, o32 syscall 4403; it fills a __kernel_timespec, two 64-bit words, whose
+ * little-endian nanoseconds land where std's __timespec64 reads its 32-bit tv_nsec. */
+extern int *__errno_location(void);
+int __clock_gettime64(int clock, void *ts) {
+    register long v0 __asm__("$2") = 4403;
+    register long a0 __asm__("$4") = clock;
+    register void *a1 __asm__("$5") = ts;
+    register long a3 __asm__("$7");
+    __asm__ volatile("syscall"
+                     : "+r"(v0), "=r"(a3)
+                     : "r"(a0), "r"(a1)
+                     : "$1", "$3", "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15", "$24", "$25",
+                       "hi", "lo", "memory");
+    if (!a3) return 0;
+    *__errno_location() = (int)v0;
+    return -1;
+}

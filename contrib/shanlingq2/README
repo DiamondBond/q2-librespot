@@ -21,7 +21,9 @@ Nothing is flashed for it.
                the target's C compiler (ring) and linker, clang and lld
   start.c, nonshared.c
                what the rootfs lacks to link against: crt1.o's __start and
-               libc_nonshared.a's stat64 family and pthread_atfork
+               libc_nonshared.a's stat64 family and pthread_atfork; and
+               glibc 2.34's __clock_gettime64, so std's clock, rustls'
+               certificate dates and the session's timestamps run past 2038
 
 Install
 -------

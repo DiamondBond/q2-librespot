@@ -63,6 +63,10 @@ cargo +nightly build --release -Zbuild-std=std,panic_abort -Zjson-target-spec \
     --target "$HERE/mipsel-q2-linux-gnu.json" \
     --no-default-features --features rustls-tls-webpki-roots,with-libmdns
 
+# std's clock is only 64-bit (past January 2038) if its weak __clock_gettime64 bound to nonshared.c's.
+llvm-nm$LLVM target/mipsel-q2-linux-gnu/release/librespot | grep -q ' T __clock_gettime64$' ||
+    { echo "librespot: std's __clock_gettime64 is unresolved; see nonshared.c" >&2; exit 1; }
+
 R="$OUT/.spotify"
 mkdir -p "$R"
 llvm-strip$LLVM -o "$R/librespot" target/mipsel-q2-linux-gnu/release/librespot
